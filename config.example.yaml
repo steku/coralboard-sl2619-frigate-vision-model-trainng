@@ -1,0 +1,193 @@
+# ==============================================================================
+# Frigate to CVAT Pipeline Configuration (Example Template)
+# ==============================================================================
+# Copy this file to 'config.yaml' and customize with your environment values:
+#   cp config.example.yaml config.yaml
+#
+# Values in config.yaml can also be overridden via environment variables
+# (FRIGATE_URL, CVAT_URL, CVAT_USER, CVAT_PASS) or CLI arguments.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Frigate NVR Settings
+# ------------------------------------------------------------------------------
+frigate:
+  # Base URL of your Frigate NVR instance (e.g., http://localhost:5000 or http://<FRIGATE_IP>:5000)
+  url: "http://localhost:5000"
+
+  # Filter by specific camera name (e.g. "driveway", "front_door"),
+  # or set to null to harvest events across all cameras.
+  camera: null
+
+  # Maximum number of detection events to harvest per run
+  limit: 200
+
+  # Set to true to wipe output images and annotations before downloading a fresh batch
+  clean: false
+
+  # Frigate snapshot image endpoint (default: "snapshot-clean.webp")
+  # Options: "snapshot-clean.webp", "snapshot.jpg"
+  snapshot_endpoint: "snapshot-clean.webp"
+
+  # Skip events and images already processed in previous training runs (tracked in yolo_dataset and .processed_events.json):
+  skip_processed: true
+
+  # Balanced harvesting across target categories to ensure equal training distribution.
+  # Options for balance_mode:
+  #   - "cvat-deficit"     : Dynamically allocates higher quotas to starved/underrepresented classes in CVAT (Recommended)
+  #   - "accuracy-deficit" : Allocates quotas based on test_server_accuracy.py scores (weakest classes first, ignores 0)
+  #   - "equal-split"      : Divides total limit equally across all target classes (e.g. 200 limit / 5 classes = 40 each)
+  #   - "strict-equal"     : Prioritizes exact balance over volume: caps all classes to count of lowest available class
+  #   - "natural"          : Normal unweighted Frigate events arrival up to limit (no balancing)
+  balance_mode: "cvat-deficit"
+
+  # Accuracy benchmark settings (used when balance_mode is "accuracy-deficit"):
+  accuracy_test_images: 60       # Number of random images evaluated against vision server (default: 60)
+  accuracy_coco_images: 0        # Optional number of COCO images to include in accuracy benchmark (default: 0)
+  accuracy_metric: "f1_score"    # Metric to compute quotas: "f1_score", "recall", "precision", "mean_iou"
+  accuracy_report: null          # Optional path to cached report JSON (skips benchmark if file exists)
+
+  # HTTP request timeout in seconds
+  timeout: 10
+
+# ------------------------------------------------------------------------------
+# CVAT Server Settings
+# ------------------------------------------------------------------------------
+cvat:
+  # Base URL of your CVAT instance (e.g., http://<CVAT_HOST>:8080 or http://cvat.local:8080)
+  url: "http://<CVAT_HOST>:8080"
+
+  # CVAT credentials for creating tasks and importing pre-annotations
+  # (Can also be passed via environment variables CVAT_USER and CVAT_PASS)
+  username: "your_cvat_username"
+  password: "your_cvat_password"
+
+  # Task name template.
+  # Supports {timestamp} for current datetime (YYYY-MM-DD HH:MM)
+  # or strftime format specifiers like %Y-%m-%d %H:%M
+  task_name_format: "Frigate Batch Review ({timestamp})"
+
+# ------------------------------------------------------------------------------
+# Target Detection Categories / Labels
+# ------------------------------------------------------------------------------
+# Categories to harvest from Frigate events and pre-annotate in CVAT tasks.
+#
+# Specify with explicit COCO category IDs:
+categories:
+  person: 1
+  dog: 2
+  cat: 3
+  car: 4
+
+# Or alternatively, specify as a simple list of labels (IDs auto-assigned 1..N):
+# labels:
+#   - person
+#   - dog
+#   - cat
+#   - car
+
+# ------------------------------------------------------------------------------
+# Local Storage / Staging Settings
+# ------------------------------------------------------------------------------
+storage:
+  # Directory where downloaded snapshots and annotations.json are staged locally
+  output_dir: "./cvat_dataset"
+
+# ------------------------------------------------------------------------------
+# Execution Modes (Optional Defaults)
+# ------------------------------------------------------------------------------
+modes:
+  # If true, download Frigate events locally without uploading to CVAT (--no-upload)
+  no_upload: false
+
+  # If true, skip downloading and upload existing local dataset directly (--upload-only)
+  upload_only: false
+
+# ------------------------------------------------------------------------------
+# Model Deployment Settings (train.sh & deploy_to_coralboard.sh)
+# ------------------------------------------------------------------------------
+deployment:
+  # Remote target host for SCP deployment of .vmfb and labels_<name>.json:
+  # e.g., "root@coralboard.local:/path/to/coralboard-sl2619-vision/models"
+  host: null
+
+  # Or local target directory to copy .vmfb and labels_<name>.json into:
+  # e.g., "../coralboard-sl2619-vision/models"
+  dir: null
+
+  # Automatically restart the vision service on Coralboard via SSH upon deployment:
+  restart_service: false
+
+  # Systemd service name on Coralboard (default: coralboard-sl2619-vision):
+  service_name: "coralboard-sl2619-vision"
+
+# ------------------------------------------------------------------------------
+# COCO Dataset Co-Training Settings
+# ------------------------------------------------------------------------------
+coco:
+  # External COCO dataset to download and include for co-training:
+  # (CVAT annotations are always automatically remapped to canonical COCO-80 IDs)
+  # Options:
+  #   - "coco128"      : Lightweight anchor dataset (128 images, ~7 MB, 80 classes, default)
+  #   - "coco-val2017" : Validation split dataset (5,000 images, ~850 MB, 80 classes)
+  dataset: "coco128"
+
+# ------------------------------------------------------------------------------
+# Training Execution Profiles (train.sh --profile <name>)
+# ------------------------------------------------------------------------------
+# Default profile used when --profile is not specified on CLI:
+default_profile: local
+
+profiles:
+  # Local workstation training on local GPU (Default)
+  local:
+    remote: false
+    device: "0"
+    batch: 8
+    workers: 8
+    cache: "ram"
+    epochs: 80
+    patience: 50
+    base_model: "yolov8n.pt"
+
+  # Remote NVIDIA DGX / Spark server training via SSH
+  spark:
+    remote: true
+    host: "user@dgx-spark.local" # Replace with your user@hostname
+    remote_dir: "~/frigate-model-training"
+    device: "0"
+    batch: 64
+    workers: 8
+    cache: "ram"
+    epochs: 80
+    patience: 50
+    base_model: "yolov8n.pt"
+    clean_images: false
+
+  # Remote Spark server training using yolo26n architecture
+  spark-yolo26n:
+    remote: true
+    host: "user@dgx-spark.local"
+    remote_dir: "~/frigate-model-training"
+    device: "0"
+    batch: 64
+    workers: 8
+    cache: "ram"
+    epochs: 80
+    patience: 50
+    base_model: "yolo26n.pt"
+    clean_images: false
+
+  # Optional local CPU fallback profile
+  cpu:
+    remote: false
+    device: "cpu"
+    batch: 16
+    workers: 4
+    cache: "ram"
+    epochs: 80
+    patience: 50
+    base_model: "yolov8n.pt"
+
+
+

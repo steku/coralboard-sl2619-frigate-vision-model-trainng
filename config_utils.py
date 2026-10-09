@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""
+Shared configuration, CVAT client, and model metadata utilities for Frigate training.
+"""
+
+import os
+from pathlib import Path
+import re
+from typing import Any, Dict, List, Optional, Tuple
+import yaml
+
+DEFAULT_CONFIG_FILES = [
+    "config.yaml",
+    "config.yml",
+]
+
+
+def find_config_file(custom_path: Optional[str] = None) -> Optional[Path]:
+    """Locate configuration YAML file from explicit path or default candidates."""
+    if custom_path:
+        path = Path(custom_path).resolve()
+        if path.is_file():
+            return path
+        return None
+
+    script_dir = Path(__file__).resolve().parent
+    cwd = Path.cwd()
+    search_dirs = [cwd]
+    if script_dir != cwd:
+        search_dirs.append(script_dir)
+
+    for directory in search_dirs:
+        for candidate in DEFAULT_CONFIG_FILES:
+            target = directory / candidate
+            if target.is_file():
+                return target
+
+    return None
+
+
+def load_config(custom_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load configuration from YAML file and return parsed dictionary.
+    Returns empty dict if no config file is found.
+    """
+    cfg_file = find_config_file(custom_path)
+    if not cfg_file:
+        return {}
+
+    try:
+        with open(cfg_file, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"[WARN] Failed to load config from {cfg_file}: {e}")
+        return {}
+
+
+def get_cvat_credentials(
+    cfg: Optional[Dict[str, Any]] = None,
+    url: Optional[str] = None,
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    """
+    Extract and resolve CVAT (url, username, password) from CLI args, env vars, or config.
+    """
+    if cfg is None:
+        cfg = load_config()
+
+    cvat_cfg = cfg.get("cvat", {}) if isinstance(cfg.get("cvat"), dict) else {}
+
+    resolved_url = (
+        url
+        or os.getenv("CVAT_URL")
+        or cvat_cfg.get("url")
+        or "http://192.168.2.1:8085"
+    )
+    resolved_user = (
+        user
+        or os.getenv("CVAT_USER")
+        or cvat_cfg.get("username")
+        or "admin"
+    )
+    resolved_pass = (
+        password
+        or os.getenv("CVAT_PASS")
+        or cvat_cfg.get("password")
+        or ""
+    )
+
+    return resolved_url.rstrip("/"), resolved_user, resolved_pass
+
+
+def get_cvat_client(
+    cfg: Optional[Dict[str, Any]] = None,
+    url: Optional[str] = None,
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+):
+    """
+    Create and return an authenticated CVAT SDK client.
+    """
+    from cvat_sdk import make_client
+
+    resolved_url, resolved_user, resolved_pass = get_cvat_credentials(cfg, url, user, password)
+    if not resolved_user or not resolved_pass:
+        raise ValueError("CVAT username and password are required. Set in config.yaml or CVAT_USER/CVAT_PASS.")
+
+    return make_client(resolved_url, credentials=(resolved_user, resolved_pass))
+
+
+def load_dataset_classes(data_yaml_path: str = "yolo_dataset/data.yaml") -> Dict[int, str]:
+    """
+    Load index-to-class-name mapping from a YOLO data.yaml or models/labels/*.json.
+    """
+    p = Path(data_yaml_path)
+    if not p.is_file():
+        # Check fallback to models/labels/*.json
+        labels_dir = Path("models/labels")
+        if labels_dir.is_dir():
+            for f in labels_dir.glob("labels_*.json"):
+                try:
+                    import json
+                    with open(f, "r", encoding="utf-8") as jf:
+                        d = json.load(jf)
+                        if "names" in d:
+                            return {int(k): str(v) for k, v in d["names"].items()}
+                except Exception:
+                    pass
+        raise FileNotFoundError(f"Dataset config not found at {data_yaml_path}")
+
+    with open(p, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    names = data.get("names", {})
+    if isinstance(names, list):
+        return {i: str(name) for i, name in enumerate(names)}
+    elif isinstance(names, dict):
+        return {int(k): str(v) for k, v in names.items()}
+    return {}
+
+
+def get_deployment_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Extract deployment configuration (host, dir, service, inferred coral server url).
+    """
+    if cfg is None:
+        cfg = load_config()
+
+    dep = cfg.get("deployment", {}) if isinstance(cfg.get("deployment"), dict) else {}
+    host = os.getenv("DEPLOY_HOST") or dep.get("host") or ""
+    deploy_dir = os.getenv("DEPLOY_DIR") or dep.get("dir") or ""
+    restart = bool(dep.get("restart_service", False))
+    service = dep.get("service_name") or "coralboard-sl2619-vision"
+
+    # Infer server URL from host if available (e.g. root@192.168.100.2:/path -> http://192.168.100.2:5000/v1/vision/detection)
+    server_url = os.getenv("CORAL_SERVER_URL")
+    if not server_url and host:
+        # Extract IP or hostname between '@' and ':'
+        match = re.search(r"@([^:/]+)", host)
+        if match:
+            ip = match.group(1)
+            server_url = f"http://{ip}:5000/v1/vision/detection"
+
+    if not server_url:
+        server_url = "http://192.168.100.2:5000/v1/vision/detection"
+
+    return {
+        "host": host,
+        "dir": deploy_dir,
+        "restart_service": restart,
+        "service_name": service,
+        "server_url": server_url,
+    }
+
+
+def get_remote_training_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Extract remote training settings (host, remote_dir, device, batch).
+    """
+    if cfg is None:
+        cfg = load_config()
+
+    rem = cfg.get("remote_training", {}) if isinstance(cfg.get("remote_training"), dict) else {}
+    host = os.getenv("SPARK_HOST") or os.getenv("DGX_HOST") or rem.get("host") or ""
+    remote_dir = rem.get("remote_dir") or "~/frigate-model-training"
+    device = str(rem.get("device", "0"))
+    try:
+        batch = int(rem.get("batch", 64))
+    except (TypeError, ValueError):
+        batch = 64
+    try:
+        workers = int(rem.get("workers", 8))
+    except (TypeError, ValueError):
+        workers = 8
+    cache = rem.get("cache", "ram")
+    if cache is True:
+        cache = "ram"
+    elif cache is False or cache is None:
+        cache = "false"
+    clean_images = bool(rem.get("clean_images", False))
+
+    return {
+        "host": host,
+        "remote_dir": remote_dir,
+        "device": device,
+        "batch": batch,
+        "workers": workers,
+        "cache": str(cache),
+        "clean_images": clean_images,
+    }
+
+
+def normalize_balance_mode(mode_str: Optional[str]) -> str:
+    """
+    Validate and return canonical balance mode:
+      - 'cvat-deficit'     : Adaptive deficit-weighted quotas based on CVAT label annotations (default)
+      - 'accuracy-deficit' : Deficit-weighted quotas based on test_server_accuracy.py scores
+      - 'equal-split'      : Flat equal division across all classes
+      - 'strict-equal'     : Clamps all classes to the lowest available class count
+      - 'natural'          : No balancing / natural order up to limit
+    """
+    if not mode_str:
+        return "cvat-deficit"
+
+    clean = mode_str.lower().strip().replace("_", "-")
+    if clean in ("accuracy", "accuracy-deficit"):
+        return "accuracy-deficit"
+    valid_modes = {"cvat-deficit", "accuracy-deficit", "equal-split", "strict-equal", "natural"}
+    if clean in valid_modes:
+        return clean
+    raise ValueError(f"Invalid balance_mode '{mode_str}'. Valid modes: {', '.join(sorted(valid_modes))}")
+
+
+# ==============================================================================
+# COCO-80 Canonical Classes & Dataset Downloader
+# ==============================================================================
+COCO_80_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
+    "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
+    "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+]
+
+COCO_80_NAME_TO_ID = {name: idx for idx, name in enumerate(COCO_80_CLASSES)}
+
+
+def get_coco_80_dict() -> Dict[int, str]:
+    """Return dictionary of canonical COCO-80 index to class name."""
+    return {idx: name for idx, name in enumerate(COCO_80_CLASSES)}
+
+
+def get_coco_id(label_name: str) -> Optional[int]:
+    """
+    Lookup official COCO-80 integer class ID for a label name.
+    Performs case-insensitive matching and handles hyphens/underscores/spaces.
+    """
+    if not label_name:
+        return None
+    normalized = str(label_name).strip().lower().replace("_", " ").replace("-", " ")
+    if normalized in COCO_80_NAME_TO_ID:
+        return COCO_80_NAME_TO_ID[normalized]
+    # Check with hyphens (e.g., 'traffic-light', 'hair-drier')
+    normalized_dash = normalized.replace(" ", "-")
+    for name, idx in COCO_80_NAME_TO_ID.items():
+        if name.replace(" ", "-") == normalized_dash:
+            return idx
+    return None
+
+
+def get_coco_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Extract COCO settings from configuration file.
+    Options:
+      - dataset: 'coco128' (default) or 'coco-val2017'
+    """
+    if cfg is None:
+        cfg = load_config()
+    coco_cfg = cfg.get("coco", {}) if isinstance(cfg.get("coco"), dict) else {}
+    ds = str(coco_cfg.get("dataset", "coco128")).strip().lower()
+    if ds in ("val2017", "coco-val2017"):
+        ds = "coco-val2017"
+    else:
+        ds = "coco128"
+
+    return {
+        "dataset": ds,
+    }
+
+
+def download_coco_dataset(dataset_name: str, target_dir: str = "datasets") -> Dict[str, str]:
+    """
+    Download and prepare a COCO dataset subset for co-training.
+    Supported options:
+      - 'coco128': Ultra-lightweight anchor (128 images, ~7 MB, 80 classes)
+      - 'coco-val2017': Robust validation split (5,000 images, ~850 MB, 80 classes)
+
+    Returns dictionary with 'train_dir', 'val_dir', and 'name'.
+    """
+    from ultralytics.utils.downloads import download
+
+    out_base = Path(target_dir).resolve()
+    out_base.mkdir(parents=True, exist_ok=True)
+
+    ds_clean = dataset_name.lower().strip()
+    if ds_clean == "coco128":
+        ds_dir = out_base / "coco128"
+        train_img_dir = ds_dir / "images" / "train2017"
+        zip_candidate = out_base / "coco128.zip"
+        if train_img_dir.is_dir() and any(train_img_dir.iterdir()):
+            print(f"[INFO] COCO128 dataset already present at {ds_dir}")
+        elif zip_candidate.is_file():
+            print(f"[INFO] Extracting existing {zip_candidate}...")
+            import zipfile
+            with zipfile.ZipFile(zip_candidate, "r") as zf:
+                zf.extractall(out_base)
+        else:
+            print(f"[INFO] Downloading COCO128 dataset (~7 MB) into {out_base}...")
+            url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/coco128.zip"
+            download(url, dir=out_base)
+
+        return {
+            "name": "coco128",
+            "train_dir": str(train_img_dir),
+            "val_dir": str(train_img_dir),
+        }
+
+    elif ds_clean in ("coco-val2017", "val2017"):
+        ds_dir = out_base / "coco"
+        val_img_dir = ds_dir / "images" / "val2017"
+        val_lbl_dir = ds_dir / "labels" / "val2017"
+
+        # 1. Download/extract labels if not present
+        lbl_zip_candidate = out_base / "coco2017labels.zip"
+        if val_lbl_dir.is_dir() and any(val_lbl_dir.iterdir()):
+            print(f"[INFO] COCO2017 labels already present at {val_lbl_dir}")
+        elif lbl_zip_candidate.is_file():
+            print(f"[INFO] Extracting existing {lbl_zip_candidate}...")
+            import zipfile
+            with zipfile.ZipFile(lbl_zip_candidate, "r") as zf:
+                zf.extractall(out_base)
+        else:
+            print(f"[INFO] Downloading COCO2017 YOLO labels (~46 MB) into {out_base}...")
+            lbl_url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/coco2017labels.zip"
+            download(lbl_url, dir=out_base)
+
+        # 2. Download/extract val images if not present
+        val_zip_candidate = ds_dir / "images" / "val2017.zip"
+        if not val_zip_candidate.is_file():
+            val_zip_candidate = out_base / "val2017.zip"
+
+        if val_img_dir.is_dir() and any(val_img_dir.iterdir()):
+            print(f"[INFO] COCO val2017 images already present at {val_img_dir}")
+        elif val_zip_candidate.is_file():
+            print(f"[INFO] Extracting existing {val_zip_candidate}...")
+            import zipfile
+            with zipfile.ZipFile(val_zip_candidate, "r") as zf:
+                zf.extractall(ds_dir / "images")
+        else:
+            print(f"[INFO] Downloading COCO val2017 images (~800 MB, 5,000 images) into {ds_dir / 'images'}...")
+            img_url = "http://images.cocodataset.org/zips/val2017.zip"
+            download(img_url, dir=ds_dir / "images")
+
+        return {
+            "name": "coco-val2017",
+            "train_dir": str(val_img_dir),
+            "val_dir": str(val_img_dir),
+        }
+
+    else:
+        raise ValueError(f"Unsupported COCO dataset: '{dataset_name}'. Choose 'coco128' or 'coco-val2017'.")
+
+
+def prepare_training_data_yaml(coco_dataset: str = "coco128", workspace_dir: str = ".") -> str:
+    """
+    Prepare COCO dataset and generate canonical 80-class data.yaml referencing
+    both the local CVAT images and external COCO images with absolute paths.
+    """
+    import yaml
+
+    workspace = Path(workspace_dir).expanduser().resolve()
+    target_datasets = workspace / "datasets"
+
+    print(f"[DATASET] Checking external COCO dataset: {coco_dataset}...")
+    coco_info = download_coco_dataset(coco_dataset, target_dir=str(target_datasets))
+    print(f"[DATASET] COCO Train Directory: {coco_info['train_dir']}")
+    print(f"[DATASET] COCO Val Directory  : {coco_info['val_dir']}")
+
+    train_paths = [
+        str(workspace / "yolo_dataset" / "images" / "train"),
+        str(Path(coco_info["train_dir"]).resolve()),
+    ]
+    val_paths = [
+        str(workspace / "yolo_dataset" / "images" / "val"),
+        str(Path(coco_info["val_dir"]).resolve()),
+    ]
+
+    data_dict = {
+        "train": train_paths,
+        "val": val_paths,
+        "names": get_coco_80_dict(),
+    }
+
+    out_yaml = workspace / "yolo_dataset" / "data.yaml"
+    out_yaml.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_yaml, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data_dict, f, sort_keys=False)
+
+    print(f"[DATASET] Unified data.yaml written to {out_yaml}")
+    return str(out_yaml)
+
+
+# ==============================================================================
+# Training Execution Profile Resolution
+# ==============================================================================
+def get_profile(
+    profile_name: Optional[str] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    config_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Resolve execution profile from config.yaml.
+    Supports named profiles (e.g. 'local', 'spark', 'cpu') with fallback
+    to legacy remote_training / top-level keys for backward compatibility.
+    """
+    if cfg is None:
+        cfg = load_config(config_path)
+
+    default_profile = str(cfg.get("default_profile") or "local").strip().lower()
+    target_name = (profile_name or default_profile).strip().lower()
+
+    profiles = cfg.get("profiles", {}) if isinstance(cfg.get("profiles"), dict) else {}
+    p_raw = profiles.get(target_name) or profiles.get(target_name.replace("_", "-")) or profiles.get(target_name.replace("-", "_"))
+    p_data = p_raw if isinstance(p_raw, dict) else {}
+
+    # Backward compatibility fallback for legacy config schema
+    if not p_data:
+        if target_name in ("spark", "remote"):
+            legacy_rem = cfg.get("remote_training", {}) or {}
+            p_data = {
+                "remote": True,
+                "host": legacy_rem.get("host"),
+                "remote_dir": legacy_rem.get("remote_dir", "~/frigate-model-training"),
+                "device": str(legacy_rem.get("device", "0")),
+                "batch": legacy_rem.get("batch", 64),
+                "workers": legacy_rem.get("workers", 8),
+                "cache": legacy_rem.get("cache", "ram"),
+                "clean_images": legacy_rem.get("clean_images", False),
+                "patience": legacy_rem.get("patience", 50),
+            }
+        else:
+            legacy_trn = cfg.get("training", {}) or {}
+            p_data = {
+                "remote": False,
+                "device": str(legacy_trn.get("device", "0")),
+                "batch": legacy_trn.get("batch", 8),
+                "workers": legacy_trn.get("workers", 8),
+                "cache": legacy_trn.get("cache", "ram"),
+                "epochs": legacy_trn.get("epochs", 80),
+                "patience": legacy_trn.get("patience", 50),
+                "base_model": legacy_trn.get("base_model", "yolov8n.pt"),
+            }
+
+    is_remote = bool(p_data.get("remote", False))
+    host = str(p_data.get("host") or "")
+    remote_dir = str(p_data.get("remote_dir") or "~/frigate-model-training")
+    device = str(p_data.get("device") if p_data.get("device") is not None else "0")
+
+    try:
+        default_batch = 64 if is_remote else 8
+        batch = int(p_data.get("batch", default_batch))
+    except (TypeError, ValueError):
+        batch = default_batch
+
+    try:
+        workers = int(p_data.get("workers", 8))
+    except (TypeError, ValueError):
+        workers = 8
+
+    cache = p_data.get("cache", "ram")
+    if cache is True:
+        cache = "ram"
+    elif cache is False or cache is None:
+        cache = "false"
+
+    try:
+        epochs = int(p_data.get("epochs", 80))
+    except (TypeError, ValueError):
+        epochs = 80
+
+    try:
+        patience = int(p_data.get("patience", 50))
+    except (TypeError, ValueError):
+        patience = 50
+
+    base_model = str(p_data.get("base_model") or "yolov8n.pt")
+    clean_images = bool(p_data.get("clean_images", False))
+
+    coco_cfg = cfg.get("coco", {}) or {}
+    coco_dataset = str(p_data.get("coco_dataset") or coco_cfg.get("dataset") or "coco128")
+
+    dep_cfg = cfg.get("deployment", {}) or {}
+    deploy_host = str(p_data.get("deploy_host") or dep_cfg.get("host") or "")
+    deploy_dir = str(p_data.get("deploy_dir") or dep_cfg.get("dir") or "")
+
+    return {
+        "name": target_name,
+        "remote": is_remote,
+        "host": host,
+        "remote_dir": remote_dir,
+        "device": device,
+        "batch": batch,
+        "workers": workers,
+        "cache": str(cache),
+        "epochs": epochs,
+        "patience": patience,
+        "base_model": base_model,
+        "clean_images": clean_images,
+        "coco_dataset": coco_dataset,
+        "deploy_host": deploy_host,
+        "deploy_dir": deploy_dir,
+    }
+
+
+def dump_profile_env(
+    profile_name: Optional[str] = None,
+    config_path: Optional[str] = None,
+) -> str:
+    """Generate shell assignment statements for train.sh eval."""
+    p = get_profile(profile_name, config_path=config_path)
+    lines = [
+        f"PROFILE_NAME='{p['name']}'",
+        f"PROFILE_REMOTE='{'true' if p['remote'] else 'false'}'",
+        f"PROFILE_HOST='{p['host']}'",
+        f"PROFILE_REMOTE_DIR='{p['remote_dir']}'",
+        f"PROFILE_DEVICE='{p['device']}'",
+        f"PROFILE_BATCH='{p['batch']}'",
+        f"PROFILE_WORKERS='{p['workers']}'",
+        f"PROFILE_CACHE='{p['cache']}'",
+        f"PROFILE_EPOCHS='{p['epochs']}'",
+        f"PROFILE_PATIENCE='{p['patience']}'",
+        f"PROFILE_BASE_MODEL='{p['base_model']}'",
+        f"PROFILE_CLEAN_IMAGES='{'true' if p['clean_images'] else 'false'}'",
+        f"PROFILE_COCO_DATASET='{p['coco_dataset']}'",
+        f"PROFILE_DEPLOY_HOST='{p['deploy_host']}'",
+        f"PROFILE_DEPLOY_DIR='{p['deploy_dir']}'",
+    ]
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Configuration profile CLI utility")
+    parser.add_argument("--profile-env", nargs="?", const="", default=None, help="Output shell env assignments for profile")
+    parser.add_argument("--config", "-c", default=None, help="Path to config.yaml")
+    args = parser.parse_args()
+
+    if args.profile_env is not None:
+        prof_arg = args.profile_env if args.profile_env else None
+        print(dump_profile_env(prof_arg, args.config))
+
+

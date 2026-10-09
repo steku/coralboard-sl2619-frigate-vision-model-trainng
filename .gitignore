@@ -1,0 +1,148 @@
+# ==============================================================================
+# Git Ignore Configuration - Frigate Model Training & Computer Vision Pipeline
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Python & Virtual Environments
+# ------------------------------------------------------------------------------
+venv/
+venv*/
+.venv/
+.venv*/
+env/
+ENV/
+.python-version
+*.py[cod]
+*$py.class
+__pycache__/
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ------------------------------------------------------------------------------
+# Model Weights, Checkpoints & Large Binary Artifacts
+# ------------------------------------------------------------------------------
+# PyTorch checkpoints & weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Exported inference graphs & intermediate representations
+*.onnx
+*.onnx_data
+*.tflite
+*.pb
+*.pbtxt
+*.mlir
+*.mlirbc
+*.tosa
+*.tosa.mlir
+*.h5
+*.hdf5
+*.fb
+*.flatbuffer
+
+# NPU / Hardware compiled models (Torq / Coral / Hailo / TensorRT)
+*.vmfb
+*.synap
+*.hef
+*.engine
+*.trt
+
+# TensorFlow SavedModel directories & onnx2tf conversion outputs
+*_saved_model/
+saved_model/
+onnx2tf_*/
+output/
+
+# Large serialized arrays & calibration datasets
+*.npy
+*.npz
+calibration_*.npy
+
+# Local model storage directory & class label mappings
+models/
+labels.json
+labels_*.json
+
+# ------------------------------------------------------------------------------
+# Training Runs, Evaluation Artifacts & Experiment Trackers
+# ------------------------------------------------------------------------------
+runs/
+results/
+wandb/
+.tensorboard/
+lightning_logs/
+*.log
+
+# ------------------------------------------------------------------------------
+# Datasets, Image Batches & Annotations
+# ------------------------------------------------------------------------------
+# Downloaded snapshots and COCO annotations from Frigate
+cvat_dataset/
+
+# YOLO formatted datasets & configs
+yolo_dataset/
+*_dataset/
+
+# General datasets folder
+datasets/
+
+# Temporary CVAT export archives, bundles & state
+cvat_export_temp.zip
+cvat_export_temp_dir/
+.last_cvat_task
+.processed_events.json
+*.zip
+*.tar
+*.tar.gz
+
+# ------------------------------------------------------------------------------
+# External Submodules / Upstream Services
+# ------------------------------------------------------------------------------
+# Cloned CVAT upstream stack
+cvat/
+
+# ------------------------------------------------------------------------------
+# Secrets & Environment Configurations
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.secret
+credentials.json
+config.yaml
+config.yml
+frigate-to-cvat.yaml
+!config.example.yaml
+!config.yaml.example
+
+# ------------------------------------------------------------------------------
+# Operating System & IDE Artifacts
+# ------------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

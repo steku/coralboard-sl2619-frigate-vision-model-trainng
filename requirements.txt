@@ -1,0 +1,44 @@
+# ==============================================================================
+# Frigate Model Training & Torq NPU Pipeline - Unified Python 3.12 Requirements
+# ==============================================================================
+# Setup:
+#   python3.12 -m venv venv-torq-312
+#   source venv-torq-312/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+# ==============================================================================
+
+# Core data extraction & image processing (frigate-to-cvat.py)
+requests>=2.28.0
+Pillow>=9.0.0
+opencv-python>=4.8.0
+PyYAML>=6.0
+
+# Annotation management & CVAT dataset handling (frigate-to-cvat.py, export-cvat-to-yolo.py)
+cvat-sdk>=2.14.0
+
+# ------------------------------------------------------------------------------
+# PyTorch & Torchvision (Pinned for NVIDIA Pascal sm_61 Architecture / GTX 1060)
+# NOTE: PyTorch 2.5+ dropped compute capability sm_61. torch==2.4.1 and
+# torchvision==0.19.1 built against CUDA 12.1 (cu121) are strictly required
+# to run on NVIDIA Pascal architecture (GTX 1060 3GB / sm_61).
+# ------------------------------------------------------------------------------
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.4.1
+torchvision==0.19.1
+
+# YOLOv8 model training, evaluation & ONNX export
+ultralytics>=8.2.0
+onnx>=1.16.0
+numpy>=1.26.0
+
+# Full INT8 Quantization & TFLite conversion (validated per official Synaptics documentation:
+# https://developer.synaptics.com/blog/custom-yolo-to-torq)
+onnx2tf==2.6.8
+onnxsim>=0.4.33
+tensorflow>=2.16.0
+tf_keras>=2.16.0
+
+# Synaptics Torq NPU Compiler & TOSA Toolchain (Python 3.12 x86_64)
+torq-compiler>=2.2.1
+tosa-converter-for-tflite>=2026.2.0
