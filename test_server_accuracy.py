@@ -3,7 +3,7 @@
 Test Coralboard Torq NPU Vision Proxy Server Accuracy.
 
 Samples a configurable number of random images and their matching ground truth labels
-from yolo_dataset/, sends HTTP requests mimicking Frigate NVR (multipart/form-data),
+from datasets/yolo/, sends HTTP requests mimicking Frigate NVR (multipart/form-data),
 and generates a comprehensive detection accuracy and latency report.
 
 Metrics reported:
@@ -42,10 +42,11 @@ def parse_args():
         default=DEFAULT_SERVER_URL,
         help=f"Vision server endpoint URL (default: {DEFAULT_SERVER_URL})",
     )
+    default_ds = "./datasets/yolo" if Path("datasets/yolo").is_dir() else "./yolo_dataset"
     parser.add_argument(
         "--dataset-dir",
-        default="./yolo_dataset",
-        help="Path to yolo_dataset directory containing images/ and labels/ (default: ./yolo_dataset)",
+        default=default_ds,
+        help=f"Path to YOLO dataset directory containing images/ and labels/ (default: {default_ds})",
     )
     parser.add_argument(
         "--split",
@@ -114,6 +115,20 @@ def parse_args():
         "--datasets-dir",
         default="./datasets",
         help="Base directory containing downloaded COCO datasets (default: ./datasets)",
+    )
+    parser.add_argument(
+        "--frigate-plus-images",
+        "--num-frigate-plus-images",
+        dest="frigate_plus_images",
+        type=int,
+        default=0,
+        help="Number of random Frigate+ dataset images to include in benchmark (default: 0)",
+    )
+    default_fp_dir = config_utils.load_config().get("frigate_plus", {}).get("path", "./datasets/frigate-plus")
+    parser.add_argument(
+        "--frigate-plus-dir",
+        default=default_fp_dir,
+        help=f"Directory containing Frigate+ dataset (default: {default_fp_dir})",
     )
     parser.add_argument(
         "--verbose",
@@ -284,6 +299,9 @@ def evaluate(args):
     coco_images_req = getattr(args, "coco_images", 0)
     coco_dataset_name = getattr(args, "coco_dataset", "coco-val2017")
     datasets_dir = getattr(args, "datasets_dir", "./datasets")
+    frigate_plus_images_req = getattr(args, "frigate_plus_images", 0)
+    frigate_plus_dir_str = getattr(args, "frigate_plus_dir", "./datasets/frigate-plus")
+    frigate_plus_dir = Path(frigate_plus_dir_str).resolve()
 
     has_dataset_dir = dataset_dir.is_dir()
     pairs = []
@@ -295,7 +313,7 @@ def evaluate(args):
         class_names = config_utils.get_coco_80_dict()
         target_split = args.split
 
-    if not pairs and coco_images_req <= 0:
+    if not pairs and coco_images_req <= 0 and frigate_plus_images_req <= 0:
         print(f"[ERROR] No image/label pairs found in {dataset_dir} for split '{target_split}'.")
         sys.exit(1)
 
@@ -324,7 +342,7 @@ def evaluate(args):
                 yolo_selected = pairs
             else:
                 yolo_selected = random.sample(pairs, args.num_images)
-        elif args.num_images == 0 and coco_images_req <= 0:
+        elif args.num_images == 0 and coco_images_req <= 0 and frigate_plus_images_req <= 0:
             yolo_selected = pairs
 
     # Sample COCO pairs if requested
@@ -341,12 +359,34 @@ def evaluate(args):
                 coco_rng = random.Random(args.seed + 1000)
                 coco_selected = coco_rng.sample(coco_pairs, coco_images_req)
 
-    selected_pairs = yolo_selected + coco_selected
+    # Sample Frigate+ pairs if requested
+    fp_selected = []
+    if frigate_plus_images_req > 0:
+        if not frigate_plus_dir.is_dir():
+            print(f"[WARN] Frigate+ dataset directory not found at: {frigate_plus_dir}")
+        else:
+            fp_pairs = collect_dataset_pairs(frigate_plus_dir, target_split)
+            if not fp_pairs and target_split != "all":
+                all_fp_pairs = collect_dataset_pairs(frigate_plus_dir, "all")
+                if all_fp_pairs:
+                    print(f"[INFO] Split '{target_split}' empty in Frigate+, using 'all' ({len(all_fp_pairs)} images).")
+                    fp_pairs = all_fp_pairs
+            if not fp_pairs:
+                print(f"[WARN] No valid image/label pairs found in Frigate+ dataset at '{frigate_plus_dir}'.")
+            else:
+                print(f"[INFO] Discovered {len(fp_pairs)} candidate images in Frigate+ dataset '{frigate_plus_dir.name}'.")
+                if frigate_plus_images_req >= len(fp_pairs):
+                    fp_selected = fp_pairs
+                else:
+                    fp_rng = random.Random(args.seed + 2000)
+                    fp_selected = fp_rng.sample(fp_pairs, frigate_plus_images_req)
+
+    selected_pairs = yolo_selected + coco_selected + fp_selected
     if not selected_pairs:
-        print("[ERROR] No images selected for evaluation. Please adjust --num-images or --coco-images.")
+        print("[ERROR] No images selected for evaluation. Please adjust --num-images, --coco-images, or --frigate-plus-images.")
         sys.exit(1)
 
-    print(f"[INFO] Evaluating {len(selected_pairs)} total images ({len(yolo_selected)} dataset, {len(coco_selected)} COCO) against: {args.server_url}")
+    print(f"[INFO] Evaluating {len(selected_pairs)} total images ({len(yolo_selected)} dataset, {len(coco_selected)} COCO, {len(fp_selected)} Frigate+) against: {args.server_url}")
     check_server_health(args.server_url)
 
     # Initialize tracking structures
@@ -543,7 +583,7 @@ def evaluate(args):
     avg_npu_ms = (sum(server_inference_times) / len(server_inference_times)) if server_inference_times else None
 
     print("\nSummary Statistics:")
-    print(f"  Images Tested       : {len(selected_pairs)} ({len(yolo_selected)} dataset, {len(coco_selected)} COCO | Failed requests: {failed_requests})")
+    print(f"  Images Tested       : {len(selected_pairs)} ({len(yolo_selected)} dataset, {len(coco_selected)} COCO, {len(fp_selected)} Frigate+ | Failed requests: {failed_requests})")
     print(f"  Ground Truth Items  : {total_gt}")
     print(f"  Detections Produced : {total_pred} (True Positives: {total_tp}, False Positives: {total_fp})")
     print(f"  Overall Precision   : {overall_prec:.1f}%")
@@ -561,6 +601,7 @@ def evaluate(args):
         "images_tested": len(selected_pairs),
         "dataset_images_tested": len(yolo_selected),
         "coco_images_tested": len(coco_selected),
+        "frigate_plus_images_tested": len(fp_selected),
         "score_threshold": args.threshold,
         "iou_threshold": args.iou_threshold,
         "overall": {
@@ -593,10 +634,12 @@ def evaluate(args):
 
 def run_accuracy_benchmark(
     server_url: str = DEFAULT_SERVER_URL,
-    dataset_dir: str = "./yolo_dataset",
+    dataset_dir: str = "./datasets/yolo" if Path("datasets/yolo").is_dir() else "./yolo_dataset",
     num_images: int = 60,
     coco_images: int = 0,
     coco_dataset: Optional[str] = None,
+    frigate_plus_images: int = 0,
+    frigate_plus_dir: Optional[str] = None,
     datasets_dir: str = "./datasets",
     split: str = "all",
     all_images: bool = False,
@@ -612,12 +655,15 @@ def run_accuracy_benchmark(
     Prints the evaluation table to stdout and returns the out_data dict.
     """
     default_coco_ds = config_utils.load_config().get("coco", {}).get("dataset", "coco-val2017")
+    default_fp_dir = config_utils.load_config().get("frigate_plus", {}).get("path", "./datasets/frigate-plus")
     args = argparse.Namespace(
         server_url=server_url,
         dataset_dir=dataset_dir,
         num_images=num_images,
         coco_images=coco_images,
         coco_dataset=coco_dataset or default_coco_ds,
+        frigate_plus_images=frigate_plus_images,
+        frigate_plus_dir=frigate_plus_dir or default_fp_dir,
         datasets_dir=datasets_dir,
         split=split,
         all=all_images,

@@ -51,7 +51,7 @@ def get_latest_task_id(client) -> int:
 
 def export_and_prepare_yolo(
     task_ids: list,
-    output_dir: str = "./yolo_dataset",
+    output_dir: str = "./datasets/yolo",
     val_split: float = 0.2,
     seed: int = 42,
     append: bool = True,
@@ -59,6 +59,10 @@ def export_and_prepare_yolo(
     cvat_user: str = None,
     cvat_pass: str = None,
     fallback_classes: list = None,
+    coco_dataset: str = "coco128",
+    datasets_dir: str = "datasets",
+    include_frigate_plus: bool = None,
+    frigate_plus_dir: str = None,
 ):
     random.seed(seed)
     out_path = Path(output_dir)
@@ -220,18 +224,44 @@ def export_and_prepare_yolo(
         total_train = len(list((out_path / "images" / "train").glob("*.*")))
         total_val = len(list((out_path / "images" / "val").glob("*.*")))
 
+        # Handle external COCO dataset for co-training
+        if not coco_dataset or coco_dataset not in ("coco128", "coco-val2017"):
+            coco_dataset = "coco128"
+        print(f"\n[INFO] Integrating external COCO dataset '{coco_dataset}' for co-training...")
+        coco_info = config_utils.download_coco_dataset(coco_dataset, target_dir=datasets_dir)
+        print(f"[INFO] External COCO train images: {coco_info['train_dir']}")
+        print(f"[INFO] External COCO val images  : {coco_info['val_dir']}")
+
         # Build names dictionary for data.yaml (canonical COCO-80 classes + any extra custom classes)
         final_names = config_utils.get_coco_80_dict()
         for idx, cname in enumerate(extra_custom_classes):
             final_names[80 + idx] = cname
 
-        # Build train / val paths in data.yaml referencing local CVAT dataset
-        train_list = [
-            str((out_path / "images" / "train").resolve()),
-        ]
-        val_list = [
-            str((out_path / "images" / "val").resolve()),
-        ]
+        # Build train / val paths in data.yaml combining local CVAT dataset, Frigate+, and COCO
+        train_list = [str((out_path / "images" / "train").resolve())]
+        val_list = [str((out_path / "images" / "val").resolve())]
+
+        cfg = load_config()
+        fp_cfg = config_utils.get_frigate_plus_config(cfg)
+        if include_frigate_plus is None:
+            include_frigate_plus = fp_cfg["enabled"]
+        if frigate_plus_dir is None:
+            frigate_plus_dir = fp_cfg["path"]
+
+        fp_path = Path(frigate_plus_dir).resolve()
+        if include_frigate_plus and fp_path.is_dir():
+            fp_train = fp_path / "images" / "train"
+            fp_val = fp_path / "images" / "val"
+            if fp_train.is_dir():
+                print(f"[INFO] External Frigate+ train images: {fp_train.resolve()}")
+                train_list.append(str(fp_train.resolve()))
+            if fp_val.is_dir():
+                print(f"[INFO] External Frigate+ val images  : {fp_val.resolve()}")
+                val_list.append(str(fp_val.resolve()))
+
+        if coco_dataset and str(coco_dataset).lower() != "none":
+            train_list.append(str(Path(coco_info["train_dir"]).resolve()))
+            val_list.append(str(Path(coco_info["val_dir"]).resolve()))
 
         yaml_content = "train:\n"
         for p in train_list:
@@ -248,12 +278,18 @@ def export_and_prepare_yolo(
         with open(yaml_path, "w", encoding="utf-8") as f:
             f.write(yaml_content)
 
+        # Write composite datasets/data.yaml if out_path is a subdirectory under datasets
+        composite_yaml_path = out_path.parent / "data.yaml" if out_path.parent.name == "datasets" else yaml_path
+        if composite_yaml_path != yaml_path:
+            with open(composite_yaml_path, "w", encoding="utf-8") as f:
+                f.write(yaml_content)
+
         print("\n" + "=" * 70)
         print(" [SUCCESS] YOLO Dataset Successfully Prepared!")
         print(f" Output Directory : {out_path.resolve()}")
         print(f" Total Train Images: {total_train}")
         print(f" Total Val Images  : {total_val}")
-        print(f" Config File       : {yaml_path}")
+        print(f" Config File       : {composite_yaml_path}")
         print(f" Classes ({len(all_classes)})     : {all_classes}")
         print("=" * 70 + "\n")
 
@@ -261,6 +297,8 @@ def export_and_prepare_yolo(
 def main():
     cfg = load_config()
     default_cvat_url, default_cvat_user, default_cvat_pass = config_utils.get_cvat_credentials(cfg)
+    coco_cfg = config_utils.get_coco_config(cfg)
+    default_coco_dataset = coco_cfg["dataset"]
 
     fallback_classes = None
     if "categories" in cfg and isinstance(cfg["categories"], dict):
@@ -284,11 +322,12 @@ def main():
         default=["latest"],
         help="CVAT Task ID(s) to export (default: 'latest' or read from .last_cvat_task)",
     )
+    default_out = "./datasets/yolo" if Path("datasets/yolo").is_dir() or not Path("yolo_dataset").is_dir() else "./yolo_dataset"
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./yolo_dataset",
-        help="Target YOLO dataset directory (default: ./yolo_dataset)",
+        default=default_out,
+        help=f"Target YOLO dataset directory (default: {default_out})",
     )
     parser.add_argument(
         "--val-split",
@@ -303,6 +342,38 @@ def main():
         action="store_false",
         default=True,
         help="Wipe and replace existing dataset instead of appending to it (default: append).",
+    )
+    parser.add_argument(
+        "--coco-dataset",
+        choices=["coco128", "coco-val2017"],
+        default=default_coco_dataset,
+        help=f"External COCO dataset to include for co-training: 'coco128' (~7 MB) or 'coco-val2017' (~850 MB) (default: {default_coco_dataset})",
+    )
+    default_fp_cfg = config_utils.get_frigate_plus_config(cfg)
+    parser.add_argument(
+        "--frigate-plus",
+        dest="include_frigate_plus",
+        action="store_true",
+        default=default_fp_cfg["enabled"],
+        help="Include Frigate+ dataset in data.yaml splits (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-frigate-plus",
+        dest="include_frigate_plus",
+        action="store_false",
+        help="Exclude Frigate+ dataset from data.yaml splits",
+    )
+    parser.add_argument(
+        "--frigate-plus-dir",
+        type=str,
+        default=default_fp_cfg["path"],
+        help=f"Path to Frigate+ dataset (default: {default_fp_cfg['path']})",
+    )
+    parser.add_argument(
+        "--datasets-dir",
+        type=str,
+        default="./datasets",
+        help="Directory to store downloaded external datasets (default: ./datasets)",
     )
     parser.add_argument(
         "--cvat-url",
@@ -336,6 +407,14 @@ def main():
                 args.cvat_user = c_user
             if args.cvat_pass == default_cvat_pass:
                 args.cvat_pass = c_pass
+            c_coco = config_utils.get_coco_config(custom_cfg)
+            if args.coco_dataset == default_coco_dataset and c_coco.get("dataset"):
+                args.coco_dataset = c_coco["dataset"]
+            c_fp = config_utils.get_frigate_plus_config(custom_cfg)
+            if args.include_frigate_plus == default_fp_cfg["enabled"]:
+                args.include_frigate_plus = c_fp["enabled"]
+            if args.frigate_plus_dir == default_fp_cfg["path"]:
+                args.frigate_plus_dir = c_fp["path"]
             if "categories" in custom_cfg and isinstance(custom_cfg["categories"], dict):
                 fallback_classes = list(custom_cfg["categories"].keys())
             elif "labels" in custom_cfg and isinstance(custom_cfg["labels"], list):
@@ -351,6 +430,10 @@ def main():
         cvat_user=args.cvat_user,
         cvat_pass=args.cvat_pass,
         fallback_classes=fallback_classes,
+        coco_dataset=args.coco_dataset,
+        datasets_dir=args.datasets_dir,
+        include_frigate_plus=args.include_frigate_plus,
+        frigate_plus_dir=args.frigate_plus_dir,
     )
 
 

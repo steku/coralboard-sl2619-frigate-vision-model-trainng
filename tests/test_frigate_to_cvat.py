@@ -99,6 +99,7 @@ def test_cli_argument_parsing(frigate_module, monkeypatch):
         "--balance-mode", "accuracy-deficit",
         "--accuracy-test-images", "50",
         "--accuracy-coco-images", "25",
+        "--accuracy-frigate-plus-images", "15",
         "--no-upload",
     ]
     monkeypatch.setattr("sys.argv", test_args)
@@ -108,6 +109,7 @@ def test_cli_argument_parsing(frigate_module, monkeypatch):
     assert parsed.balance_mode == "accuracy-deficit"
     assert parsed.accuracy_test_images == 50
     assert parsed.accuracy_coco_images == 25
+    assert parsed.accuracy_frigate_plus_images == 15
     assert parsed.no_upload is True
 
 

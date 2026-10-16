@@ -46,7 +46,13 @@ relocate_root_checkpoints() {
 CONFIG_FILE="config.yaml"
 RUNNER="local"                    # Default: local GPU training
 DEVICE="0"                        # Default: GPU '0'
-DATA_YAML="yolo_dataset/data.yaml"
+if [[ -f "datasets/data.yaml" || ( ! -f "datasets/yolo/data.yaml" && ! -f "yolo_dataset/data.yaml" ) ]]; then
+    DATA_YAML="datasets/data.yaml"
+elif [[ -f "datasets/yolo/data.yaml" ]]; then
+    DATA_YAML="datasets/yolo/data.yaml"
+else
+    DATA_YAML="yolo_dataset/data.yaml"
+fi
 IMGSZ=320                         # Strictly 320 for Coralboard SL2619 NSS slices
 EPOCHS=80
 PATIENCE=50
@@ -88,6 +94,10 @@ DEPLOY_DIR=""
 DO_EXPORT=false
 EXPORT_TASK_IDS=""
 DO_APPEND=true
+COCO_DATASET="coco128"
+USE_FRIGATE_PLUS=""
+FRIGATE_PLUS_DIR="datasets/frigate-plus"
+EXPLICIT_FRIGATE_PLUS_DIR=false
 
 # Output directories
 OUTPUT_DIR="output"
@@ -115,7 +125,7 @@ usage() {
     echo ""
     echo "Primary Workflows:"
     echo "  --compile [MODEL.pt]    Skip training; compile checkpoint directly (or latest best.pt)"
-    echo "  --export [TASK_ID|all]  Export CVAT task(s) to yolo_dataset/ before training (default: latest)"
+    echo "  --export [TASK_ID|all]  Export CVAT task(s) to datasets/yolo/ before training (default: latest)"
     echo "  --deploy [DEST]         Deploy compiled model & labels to local dir or remote host (user@ip:/path)"
     echo ""
     echo "Workflow Controls:"
@@ -130,6 +140,10 @@ usage() {
     echo "  --device DEV            Training device ('0' local GPU, 'cpu', or '0,1' Spark)"
     echo "  --host USER@HOST        SSH destination for remote training"
     echo "  --resume                Resume/fine-tune from previous checkpoint (default: train from scratch)"
+    echo "  --coco-dataset NAME     COCO subset for co-training ('coco128' or 'coco-val2017')"
+    echo "  --frigate-plus          Include Frigate+ dataset in training & validation splits"
+    echo "  --no-frigate-plus       Exclude Frigate+ dataset from training splits"
+    echo "  --frigate-plus-dir DIR  Directory containing Frigate+ dataset (default: datasets/frigate-plus)"
     echo "  --replace               Wipe and replace existing dataset instead of appending"
     echo ""
     echo "Fine-Tuning & Warm-Up Overrides (COCO-80 Domain Adaptation):"
@@ -169,6 +183,7 @@ EXPLICIT_PATIENCE=false
 EXPLICIT_WORKERS=false
 EXPLICIT_CACHE=false
 EXPLICIT_BASE_MODEL=false
+EXPLICIT_COCO=false
 EXPLICIT_OPTIMIZER=false
 EXPLICIT_LR0=false
 EXPLICIT_LRF=false
@@ -211,6 +226,24 @@ while [[ $# -gt 0 ]]; do
         --replace)
             DO_APPEND=false
             shift
+            ;;
+        --coco-dataset|--coco)
+            COCO_DATASET="$2"
+            EXPLICIT_COCO=true
+            shift 2
+            ;;
+        --frigate-plus)
+            USE_FRIGATE_PLUS="true"
+            shift
+            ;;
+        --no-frigate-plus)
+            USE_FRIGATE_PLUS="false"
+            shift
+            ;;
+        --frigate-plus-dir)
+            FRIGATE_PLUS_DIR="$2"
+            EXPLICIT_FRIGATE_PLUS_DIR=true
+            shift 2
             ;;
         --data-yaml)
             DATA_YAML="$2"
@@ -397,8 +430,14 @@ if [[ "${EXPLICIT_HOST}" == "false" && -n "${PROFILE_HOST}" ]]; then
     SPARK_HOST="${PROFILE_HOST}"
 fi
 
-if [[ "${EXPLICIT_BATCH}" == "false" && -n "${PROFILE_BATCH}" ]]; then
-    BATCH="${PROFILE_BATCH}"
+if [[ "${EXPLICIT_BATCH}" == "false" ]]; then
+    if [[ -n "${PROFILE_BATCH}" ]]; then
+        BATCH="${PROFILE_BATCH}"
+    elif [[ "${RUNNER}" == "spark" ]]; then
+        BATCH=32
+    else
+        BATCH=8
+    fi
 fi
 
 if [[ "${EXPLICIT_DEVICE}" == "false" && -n "${PROFILE_DEVICE}" ]]; then
@@ -424,6 +463,21 @@ fi
 if [[ "${EXPLICIT_BASE_MODEL}" == "false" && -n "${PROFILE_BASE_MODEL}" ]]; then
     BASE_MODEL="${PROFILE_BASE_MODEL}"
 fi
+
+if [[ "${EXPLICIT_COCO}" == "false" && -n "${PROFILE_COCO_DATASET}" ]]; then
+    COCO_DATASET="${PROFILE_COCO_DATASET}"
+fi
+
+if [[ -z "${USE_FRIGATE_PLUS}" ]]; then
+    USE_FRIGATE_PLUS="${PROFILE_FRIGATE_PLUS:-true}"
+fi
+
+if [[ "${EXPLICIT_FRIGATE_PLUS_DIR}" == "false" && -n "${PROFILE_FRIGATE_PLUS_DIR}" ]]; then
+    FRIGATE_PLUS_DIR="${PROFILE_FRIGATE_PLUS_DIR}"
+fi
+
+USE_FRIGATE_PLUS_PY="True"
+[[ "${USE_FRIGATE_PLUS}" == "false" ]] && USE_FRIGATE_PLUS_PY="False"
 
 if [[ "${EXPLICIT_OPTIMIZER}" == "false" && -n "${PROFILE_OPTIMIZER}" ]]; then
     OPTIMIZER="${PROFILE_OPTIMIZER}"
@@ -512,7 +566,7 @@ fi
 echo "  Hyperparams:   Batch: ${BATCH}, Workers: ${WORKERS}, Epochs: ${EPOCHS}, Patience: ${PATIENCE}, Cache: ${CACHE}"
 echo "  Fine-Tuning:   Optimizer: ${OPTIMIZER}, lr0: ${LR0}, lrf: ${LRF}, cos_lr: ${COS_LR}"
 echo "  Warm-Up:       Epochs: ${WARMUP_EPOCHS}, Momentum: ${WARMUP_MOMENTUM}, Bias LR: ${WARMUP_BIAS_LR}"
-echo "  Base Model:    ${BASE_MODEL} (Run Name: ${RUN_NAME})"
+echo "  Base Model:    ${BASE_MODEL} (Run Name: ${RUN_NAME}, Co-Training: ${COCO_DATASET})"
 echo "  Resolution:    ${IMGSZ}x${IMGSZ}"
 echo "=========================================================================="
 
@@ -551,8 +605,19 @@ if [[ "${DO_EXPORT}" == "true" ]]; then
     if [[ "${DO_APPEND}" == "false" ]]; then
         EXPORT_CMD+=(--replace)
     fi
+    if [[ -n "${COCO_DATASET}" ]]; then
+        EXPORT_CMD+=(--coco-dataset "${COCO_DATASET}")
+    fi
+    if [[ "${USE_FRIGATE_PLUS}" == "true" ]]; then
+        EXPORT_CMD+=(--frigate-plus)
+    elif [[ "${USE_FRIGATE_PLUS}" == "false" ]]; then
+        EXPORT_CMD+=(--no-frigate-plus)
+    fi
+    if [[ -n "${FRIGATE_PLUS_DIR}" ]]; then
+        EXPORT_CMD+=(--frigate-plus-dir "${FRIGATE_PLUS_DIR}")
+    fi
     DATA_DIR="$(dirname "${DATA_YAML}")"
-    if [[ "${DATA_DIR}" != "." && "${DATA_DIR}" != "yolo_dataset" ]]; then
+    if [[ "${DATA_DIR}" != "." && "${DATA_DIR}" != "datasets/yolo" && "${DATA_DIR}" != "yolo_dataset" ]]; then
         EXPORT_CMD+=(--output-dir "${DATA_DIR}")
     fi
     log_info "Running: ${EXPORT_CMD[*]}"
@@ -641,20 +706,37 @@ elif [[ "${RUNNER}" == "spark" ]]; then
         SCRIPTS_TO_SYNC=(config_utils.py)
         [[ -f "${CONFIG_FILE}" ]] && SCRIPTS_TO_SYNC+=("${CONFIG_FILE}")
 
+        LOCAL_YOLO_DIR="datasets/yolo"
+        [[ ! -d "${LOCAL_YOLO_DIR}" && -d "yolo_dataset" ]] && LOCAL_YOLO_DIR="yolo_dataset"
+
         if command -v rsync &>/dev/null; then
             rsync -avz --copy-links \
                 "${SCRIPTS_TO_SYNC[@]}" \
                 "${SPARK_HOST}:${REMOTE_DIR}/"
 
+            ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/datasets'"
             rsync -avz --delete \
+                --exclude="coco*" \
                 --exclude="*.zip" \
                 --exclude="*.tar*" \
                 --exclude="__pycache__" \
-                yolo_dataset/ "${SPARK_HOST}:${REMOTE_DIR}/yolo_dataset/"
+                "${LOCAL_YOLO_DIR}/" "${SPARK_HOST}:${REMOTE_DIR}/datasets/yolo/"
+
+            if [[ "${USE_FRIGATE_PLUS}" == "true" && -d "${FRIGATE_PLUS_DIR}" ]]; then
+                log_info "Synchronizing Frigate+ dataset to ${SPARK_HOST}:${REMOTE_DIR}/datasets/frigate-plus/..."
+                ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/datasets/frigate-plus'"
+                rsync -avz --delete \
+                    --exclude="__pycache__" \
+                    "${FRIGATE_PLUS_DIR}/" "${SPARK_HOST}:${REMOTE_DIR}/datasets/frigate-plus/"
+            fi
         else
             scp "${SCRIPTS_TO_SYNC[@]}" "${SPARK_HOST}:${REMOTE_DIR}/"
-            ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/yolo_dataset'/{images,labels}"
-            scp -r yolo_dataset/images yolo_dataset/labels "${SPARK_HOST}:${REMOTE_DIR}/yolo_dataset/"
+            ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/datasets/yolo'/{images,labels}"
+            scp -r "${LOCAL_YOLO_DIR}/images" "${LOCAL_YOLO_DIR}/labels" "${SPARK_HOST}:${REMOTE_DIR}/datasets/yolo/"
+            if [[ "${USE_FRIGATE_PLUS}" == "true" && -d "${FRIGATE_PLUS_DIR}" ]]; then
+                ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/datasets/frigate-plus'/{images,labels}"
+                scp -r "${FRIGATE_PLUS_DIR}/images" "${FRIGATE_PLUS_DIR}/labels" "${SPARK_HOST}:${REMOTE_DIR}/datasets/frigate-plus/"
+            fi
         fi
 
         # Sync previous checkpoint if resuming or base model if present locally
@@ -668,14 +750,14 @@ elif [[ "${RUNNER}" == "spark" ]]; then
             scp "${BASE_MODEL}" "${SPARK_HOST}:${REMOTE_DIR}/models/base/"
         fi
 
-        # Prepare remote data.yaml with canonical COCO-80 classes and remote paths
-        log_info "Generating canonical COCO-80 data.yaml on Spark..."
+        # Prepare remote dataset manifest and canonical COCO-80 data.yaml
+        log_info "Preparing remote dataset manifest on Spark..."
         ssh "${SPARK_HOST}" "
             set -e
             cd \"${REMOTE_DIR}\"
             source \"${REMOTE_DIR}/venv/bin/activate\"
             export PYTHONPATH=\"${REMOTE_DIR}:\${PYTHONPATH:-}\"
-            python3 -c \"import config_utils; config_utils.prepare_training_data_yaml('${REMOTE_DIR}')\"
+            python3 -c \"import config_utils; config_utils.prepare_training_data_yaml('${COCO_DATASET}', '${REMOTE_DIR}', include_frigate_plus=${USE_FRIGATE_PLUS_PY}, frigate_plus_dir='${FRIGATE_PLUS_DIR}')\"
         "
 
         # Launch training on Spark
@@ -703,7 +785,7 @@ elif [[ "${RUNNER}" == "spark" ]]; then
             echo '  Executing: yolo detect train on NVIDIA DGX Spark'
             echo '=========================================================================='
             yolo detect train \
-                data='yolo_dataset/data.yaml' \
+                data='datasets/data.yaml' \
                 model=\"\${START_MODEL}\" \
                 epochs=${EPOCHS} \
                 imgsz=320 \
@@ -745,15 +827,15 @@ elif [[ "${RUNNER}" == "spark" ]]; then
     # Clean remote images if requested
     if [[ "${CLEAN_IMAGES}" == "true" ]]; then
         log_info "Cleaning up remote training images on ${SPARK_HOST}..."
-        ssh "${SPARK_HOST}" "rm -rf \"${REMOTE_DIR}/yolo_dataset/images\" \"${REMOTE_DIR}/datasets\"" || true
+        ssh "${SPARK_HOST}" "rm -rf \"${REMOTE_DIR}/datasets/yolo/images\" \"${REMOTE_DIR}/datasets/frigate-plus/images\" \"${REMOTE_DIR}/yolo_dataset/images\" \"${REMOTE_DIR}/datasets\"" || true
     fi
 
 else
     # --------------------------------------------------------------------------
     # Local GPU/CPU Training (Default)
     # --------------------------------------------------------------------------
-    if [[ "${DATA_YAML}" == "yolo_dataset/data.yaml" && -d "yolo_dataset/images/train" ]]; then
-        python3 -c "import config_utils; config_utils.prepare_training_data_yaml('.')"
+    if [[ ( "${DATA_YAML}" == "datasets/data.yaml" || "${DATA_YAML}" == "datasets/yolo/data.yaml" || "${DATA_YAML}" == "yolo_dataset/data.yaml" ) && ( -d "datasets/yolo/images/train" || -d "yolo_dataset/images/train" || -d "${FRIGATE_PLUS_DIR}/images/train" ) ]]; then
+        python3 -c "import config_utils; config_utils.prepare_training_data_yaml('${COCO_DATASET}', '.', include_frigate_plus=${USE_FRIGATE_PLUS_PY}, frigate_plus_dir='${FRIGATE_PLUS_DIR}')"
     fi
 
     if [[ ! -f "${DATA_YAML}" ]]; then

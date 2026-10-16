@@ -73,6 +73,7 @@ def test_get_profile_resolution():
     assert p_spark["name"] == "spark-torq"
     assert p_spark["target"] == "torq"
     assert p_spark["remote"] is True
+    assert p_spark["batch"] == 32
     assert p_spark["patience"] == 50
     assert p_spark["optimizer"] == "AdamW"
     assert p_spark["lr0"] == 0.0005
@@ -171,6 +172,9 @@ def test_dump_profile_env():
     assert "PROFILE_TARGET='torq'" in env_str
     assert "PROFILE_BATCH=" in env_str
     assert "PROFILE_BASE_MODEL=" in env_str
+    assert "PROFILE_COCO_DATASET=" in env_str
+    assert "PROFILE_FRIGATE_PLUS=" in env_str
+    assert "PROFILE_FRIGATE_PLUS_DIR=" in env_str
     assert "PROFILE_PATIENCE='50'" in env_str
     assert "PROFILE_OPTIMIZER='AdamW'" in env_str
     assert "PROFILE_LR0='0.0005'" in env_str
@@ -186,25 +190,49 @@ def test_dump_profile_env():
     assert "PROFILE_BASE_MODEL='yolov9s.pt'" in nvidia_env_str
 
 
-def test_prepare_training_data_yaml(tmp_path):
+def test_prepare_training_data_yaml(tmp_path, monkeypatch):
     # Create fake workspace directory structure
-    yolo_dir = tmp_path / "yolo_dataset"
+    yolo_dir = tmp_path / "datasets" / "yolo"
     (yolo_dir / "images" / "train").mkdir(parents=True)
     (yolo_dir / "images" / "val").mkdir(parents=True)
 
+    fp_dir = tmp_path / "datasets" / "frigate-plus"
+    (fp_dir / "images" / "train").mkdir(parents=True)
+    (fp_dir / "images" / "val").mkdir(parents=True)
+
+    coco_train = tmp_path / "datasets" / "coco128" / "images" / "train2017"
+    coco_train.mkdir(parents=True)
+
+    def mock_download(dataset_name, target_dir="datasets"):
+        return {
+            "train_dir": str(coco_train),
+            "val_dir": str(coco_train),
+        }
+
+    monkeypatch.setattr(config_utils, "download_coco_dataset", mock_download)
+
     data_yaml = config_utils.prepare_training_data_yaml(
+        coco_dataset="coco128",
         workspace_dir=str(tmp_path),
+        include_frigate_plus=True,
+        frigate_plus_dir=str(fp_dir),
     )
     assert os.path.isfile(data_yaml)
+    assert str(data_yaml).endswith("datasets/data.yaml")
+    assert (tmp_path / "datasets" / "yolo" / "data.yaml").is_file()
 
     with open(data_yaml, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     assert "train" in data
     assert "val" in data
-    assert data["train"] == [str(yolo_dir / "images" / "train")]
-    assert data["val"] == [str(yolo_dir / "images" / "val")]
+    assert len(data["train"]) == 3
+    assert len(data["val"]) == 3
+    assert str(yolo_dir / "images" / "train") in data["train"]
+    assert str(fp_dir / "images" / "train") in data["train"]
+    assert str(yolo_dir / "images" / "val") in data["val"]
+    assert str(fp_dir / "images" / "val") in data["val"]
     assert "names" in data
-    assert len(data["names"]) == 80
     assert data["names"][0] == "person"
+
 

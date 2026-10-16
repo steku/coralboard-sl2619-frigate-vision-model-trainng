@@ -109,11 +109,17 @@ def get_cvat_client(
     return make_client(resolved_url, credentials=(resolved_user, resolved_pass))
 
 
-def load_dataset_classes(data_yaml_path: str = "yolo_dataset/data.yaml") -> Dict[int, str]:
+def load_dataset_classes(data_yaml_path: str = "datasets/data.yaml") -> Dict[int, str]:
     """
     Load index-to-class-name mapping from a YOLO data.yaml or models/labels/*.json.
     """
     p = Path(data_yaml_path)
+    if not p.is_file() and data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
+        for candidate in ("datasets/data.yaml", "datasets/yolo/data.yaml", "yolo_dataset/data.yaml"):
+            if Path(candidate).is_file():
+                p = Path(candidate)
+                break
+
     if not p.is_file():
         # Check fallback to models/labels/*.json
         labels_dir = Path("models/labels")
@@ -186,9 +192,9 @@ def get_remote_training_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
     remote_dir = rem.get("remote_dir") or "~/frigate-model-training"
     device = str(rem.get("device", "0"))
     try:
-        batch = int(rem.get("batch", 64))
+        batch = int(rem.get("batch", 32))
     except (TypeError, ValueError):
-        batch = 64
+        batch = 32
     try:
         workers = int(rem.get("workers", 8))
     except (TypeError, ValueError):
@@ -292,6 +298,28 @@ def get_coco_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     }
 
 
+def get_frigate_plus_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Extract Frigate+ dataset settings from configuration file.
+    Options:
+      - enabled: bool (defaults to True if directory exists, else False)
+      - path: str (default 'datasets/frigate-plus')
+    """
+    if cfg is None:
+        cfg = load_config()
+    fp_cfg = cfg.get("frigate_plus", {}) if isinstance(cfg.get("frigate_plus"), dict) else {}
+    enabled_val = fp_cfg.get("enabled", None)
+    fp_path = str(fp_cfg.get("path", "datasets/frigate-plus")).strip()
+    if enabled_val is None:
+        enabled = Path(fp_path).is_dir()
+    else:
+        enabled = bool(enabled_val)
+    return {
+        "enabled": enabled,
+        "path": fp_path,
+    }
+
+
 def download_coco_dataset(dataset_name: str, target_dir: str = "datasets") -> Dict[str, str]:
     """
     Download and prepare a COCO dataset subset for co-training.
@@ -375,33 +403,77 @@ def download_coco_dataset(dataset_name: str, target_dir: str = "datasets") -> Di
         raise ValueError(f"Unsupported COCO dataset: '{dataset_name}'. Choose 'coco128' or 'coco-val2017'.")
 
 
-def prepare_training_data_yaml(workspace_dir: str = ".", **_kwargs) -> str:
+def prepare_training_data_yaml(
+    coco_dataset: Optional[str] = "coco128",
+    workspace_dir: str = ".",
+    include_frigate_plus: Optional[bool] = None,
+    frigate_plus_dir: Optional[str] = None,
+) -> str:
     """
-    Generate canonical 80-class data.yaml referencing the local CVAT train/val
-    images with absolute paths (preserving any custom classes >= 80).
+    Prepare external datasets and generate canonical 80-class data.yaml referencing
+    local CVAT images, optional Frigate+ images, and external COCO images with absolute paths.
+    Target output: datasets/data.yaml (and datasets/yolo/data.yaml for backward compatibility).
     """
     workspace = Path(workspace_dir).expanduser().resolve()
-    out_yaml = workspace / "yolo_dataset" / "data.yaml"
+    target_datasets = workspace / "datasets"
+    yolo_dir = target_datasets / "yolo" if (target_datasets / "yolo").is_dir() or not (workspace / "yolo_dataset").is_dir() else (workspace / "yolo_dataset")
+    out_yaml = target_datasets / "data.yaml"
+    legacy_out_yaml = yolo_dir / "data.yaml"
+
+    cfg = load_config()
+    fp_cfg = get_frigate_plus_config(cfg)
+    if include_frigate_plus is None:
+        include_frigate_plus = fp_cfg["enabled"]
+    if frigate_plus_dir is None:
+        frigate_plus_dir = fp_cfg["path"]
+
+    fp_path = (workspace / frigate_plus_dir).resolve() if not Path(frigate_plus_dir).is_absolute() else Path(frigate_plus_dir)
 
     names = get_coco_80_dict()
-    if out_yaml.is_file():
-        try:
-            with open(out_yaml, "r", encoding="utf-8") as f:
-                existing = yaml.safe_load(f) or {}
-            existing_names = existing.get("names", {})
-            if isinstance(existing_names, dict):
-                for k, v in existing_names.items():
-                    if int(k) >= 80:
-                        names[int(k)] = str(v)
-        except Exception:
-            pass
+    for cand in (out_yaml, legacy_out_yaml):
+        if cand.is_file():
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    existing = yaml.safe_load(f) or {}
+                existing_names = existing.get("names", {})
+                if isinstance(existing_names, dict):
+                    for k, v in existing_names.items():
+                        if int(k) >= 80:
+                            names[int(k)] = str(v)
+                break
+            except Exception:
+                pass
 
-    train_paths = [
-        str(workspace / "yolo_dataset" / "images" / "train"),
-    ]
-    val_paths = [
-        str(workspace / "yolo_dataset" / "images" / "val"),
-    ]
+    train_paths = []
+    val_paths = []
+
+    # 1. Local CVAT dataset splits
+    yolo_train = yolo_dir / "images" / "train"
+    yolo_val = yolo_dir / "images" / "val"
+    if yolo_train.is_dir():
+        train_paths.append(str(yolo_train.resolve()))
+    if yolo_val.is_dir():
+        val_paths.append(str(yolo_val.resolve()))
+
+    # 2. Frigate+ dataset splits
+    if include_frigate_plus and fp_path.is_dir():
+        fp_train = fp_path / "images" / "train"
+        fp_val = fp_path / "images" / "val"
+        if fp_train.is_dir():
+            print(f"[DATASET] Including Frigate+ Train Directory: {fp_train.resolve()}")
+            train_paths.append(str(fp_train.resolve()))
+        if fp_val.is_dir():
+            print(f"[DATASET] Including Frigate+ Val Directory  : {fp_val.resolve()}")
+            val_paths.append(str(fp_val.resolve()))
+
+    # 3. External COCO dataset splits
+    if coco_dataset and str(coco_dataset).lower() != "none":
+        print(f"[DATASET] Checking external COCO dataset: {coco_dataset}...")
+        coco_info = download_coco_dataset(coco_dataset, target_dir=str(target_datasets))
+        print(f"[DATASET] COCO Train Directory: {coco_info['train_dir']}")
+        print(f"[DATASET] COCO Val Directory  : {coco_info['val_dir']}")
+        train_paths.append(str(Path(coco_info["train_dir"]).resolve()))
+        val_paths.append(str(Path(coco_info["val_dir"]).resolve()))
 
     data_dict = {
         "train": train_paths,
@@ -413,7 +485,14 @@ def prepare_training_data_yaml(workspace_dir: str = ".", **_kwargs) -> str:
     with open(out_yaml, "w", encoding="utf-8") as f:
         yaml.safe_dump(data_dict, f, sort_keys=False)
 
-    print(f"[DATASET] Canonical COCO-80 data.yaml written to {out_yaml}")
+    if yolo_dir.is_dir() and yolo_dir != target_datasets:
+        try:
+            with open(legacy_out_yaml, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data_dict, f, sort_keys=False)
+        except Exception:
+            pass
+
+    print(f"[DATASET] Unified data.yaml written to {out_yaml}")
     return str(out_yaml)
 
 
@@ -427,8 +506,7 @@ def get_profile(
 ) -> Dict[str, Any]:
     """
     Resolve execution profile from config.yaml.
-    Supports named profiles (e.g. 'local', 'spark', 'cpu') with fallback
-    to legacy remote_training / top-level keys for backward compatibility.
+    Supports named profiles (e.g. 'torq', 'spark-torq', 'nvidia', 'spark-nvidia', 'cpu-torq').
     """
     if cfg is None:
         cfg = load_config(config_path)
@@ -459,7 +537,7 @@ def get_profile(
     device = str(p_data.get("device") if p_data.get("device") is not None else "0")
 
     try:
-        default_batch = 64 if is_remote else 8
+        default_batch = 32 if is_remote else 8
         batch = int(p_data.get("batch", default_batch))
     except (TypeError, ValueError):
         batch = default_batch
@@ -498,6 +576,9 @@ def get_profile(
     default_base_model = "yolov9s.pt" if target == "nvidia" else "yolov8n.pt"
     base_model = str(p_data.get("base_model") or default_base_model)
     clean_images = bool(p_data.get("clean_images", False))
+
+    coco_cfg = cfg.get("coco", {}) or {}
+    coco_dataset = str(p_data.get("coco_dataset") or coco_cfg.get("dataset") or "coco128")
 
     optimizer = str(p_data.get("optimizer") or "AdamW")
     try:
@@ -539,6 +620,10 @@ def get_profile(
         deploy_host = str(p_data.get("deploy_host") or dep_cfg.get("host") or "")
         deploy_dir = str(p_data.get("deploy_dir") or dep_cfg.get("dir") or "")
 
+    fp_cfg = get_frigate_plus_config(cfg)
+    frigate_plus_enabled = p_data.get("frigate_plus", fp_cfg["enabled"])
+    frigate_plus_dir = str(p_data.get("frigate_plus_dir", fp_cfg["path"]))
+
     return {
         "name": target_name,
         "target": target,
@@ -552,6 +637,7 @@ def get_profile(
         "epochs": epochs,
         "patience": patience,
         "base_model": base_model,
+        "coco_dataset": coco_dataset,
         "clean_images": clean_images,
         "optimizer": optimizer,
         "lr0": lr0,
@@ -562,6 +648,8 @@ def get_profile(
         "warmup_bias_lr": warmup_bias_lr,
         "deploy_host": deploy_host,
         "deploy_dir": deploy_dir,
+        "frigate_plus": bool(frigate_plus_enabled),
+        "frigate_plus_dir": frigate_plus_dir,
     }
 
 
@@ -584,6 +672,7 @@ def dump_profile_env(
         f"PROFILE_EPOCHS='{p['epochs']}'",
         f"PROFILE_PATIENCE='{p['patience']}'",
         f"PROFILE_BASE_MODEL='{p['base_model']}'",
+        f"PROFILE_COCO_DATASET='{p['coco_dataset']}'",
         f"PROFILE_CLEAN_IMAGES='{'true' if p['clean_images'] else 'false'}'",
         f"PROFILE_OPTIMIZER='{p['optimizer']}'",
         f"PROFILE_LR0='{p['lr0']}'",
@@ -594,6 +683,8 @@ def dump_profile_env(
         f"PROFILE_WARMUP_BIAS_LR='{p['warmup_bias_lr']}'",
         f"PROFILE_DEPLOY_HOST='{p['deploy_host']}'",
         f"PROFILE_DEPLOY_DIR='{p['deploy_dir']}'",
+        f"PROFILE_FRIGATE_PLUS='{'true' if p['frigate_plus'] else 'false'}'",
+        f"PROFILE_FRIGATE_PLUS_DIR='{p['frigate_plus_dir']}'",
     ]
     return "\n".join(lines)
 

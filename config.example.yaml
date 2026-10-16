@@ -29,7 +29,7 @@ frigate:
   # Options: "snapshot-clean.webp", "snapshot.jpg"
   snapshot_endpoint: "snapshot-clean.webp"
 
-  # Skip events and images already processed in previous training runs (tracked in yolo_dataset and .processed_events.json):
+  # Skip events and images already processed in previous training runs (tracked in datasets/yolo and .processed_events.json):
   skip_processed: true
 
   # Balanced harvesting across target categories to ensure equal training distribution.
@@ -44,6 +44,7 @@ frigate:
   # Accuracy benchmark settings (used when balance_mode is "accuracy-deficit"):
   accuracy_test_images: 60       # Number of random images evaluated against vision server (default: 60)
   accuracy_coco_images: 0        # Optional number of COCO images to include in accuracy benchmark (default: 0)
+  accuracy_frigate_plus_images: 0 # Optional number of Frigate+ images to include in accuracy benchmark (default: 0)
   accuracy_metric: "f1_score"    # Metric to compute quotas: "f1_score", "recall", "precision", "mean_iou"
   accuracy_report: null          # Optional path to cached report JSON (skips benchmark if file exists)
 
@@ -91,7 +92,7 @@ categories:
 # ------------------------------------------------------------------------------
 storage:
   # Directory where downloaded snapshots and annotations.json are staged locally
-  output_dir: "./cvat_dataset"
+  output_dir: "./datasets/staging"
 
 # ------------------------------------------------------------------------------
 # Execution Modes (Optional Defaults)
@@ -120,6 +121,25 @@ deployment:
 
   # Systemd service name on Coralboard (default: coralboard-sl2619-vision):
   service_name: "coralboard-sl2619-vision"
+
+# ------------------------------------------------------------------------------
+# External COCO Dataset Settings (Co-Training)
+# ------------------------------------------------------------------------------
+coco:
+  # External COCO dataset to download and include for co-training:
+  # (CVAT annotations are always automatically remapped to canonical COCO-80 IDs)
+  # Options:
+  #   - "coco128"      : Lightweight anchor dataset (128 images, ~7 MB, 80 classes, default)
+  #   - "coco-val2017" : Validation split dataset (5,000 images, ~850 MB, 80 classes)
+  dataset: "coco128"
+
+# ------------------------------------------------------------------------------
+# Frigate+ Dataset Settings (Co-Training & Validation)
+# ------------------------------------------------------------------------------
+frigate_plus:
+  # Enable Frigate+ dataset for training and validation splits
+  enabled: true
+  path: "./datasets/frigate-plus"
 
 # ------------------------------------------------------------------------------
 # Training Execution Profiles (train.sh --profile <name>)
@@ -159,7 +179,7 @@ profiles:
     host: "user@dgx-spark.local" # Replace with your user@hostname
     remote_dir: "~/frigate-model-training"
     device: "0"
-    batch: 64
+    batch: 32
     workers: 8
     cache: "ram"
     epochs: 80
@@ -181,7 +201,7 @@ profiles:
     host: "user@dgx-spark.local"
     remote_dir: "~/frigate-model-training"
     device: "0"
-    batch: 64
+    batch: 32
     workers: 8
     cache: "ram"
     epochs: 80
@@ -222,7 +242,7 @@ profiles:
     host: "user@dgx-spark.local"
     remote_dir: "~/frigate-model-training"
     device: "0"
-    batch: 64
+    batch: 32
     workers: 8
     cache: "ram"
     epochs: 80

@@ -21,8 +21,13 @@ from onnx import helper, TensorProto, numpy_helper
 import yaml
 
 
-def load_dataset_metadata(data_yaml_path: str = "yolo_dataset/data.yaml"):
+def load_dataset_metadata(data_yaml_path: str = "datasets/data.yaml"):
     path = Path(data_yaml_path)
+    if not path.exists() and data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
+        for cand in ("datasets/data.yaml", "datasets/yolo/data.yaml", "yolo_dataset/data.yaml"):
+            if Path(cand).exists():
+                path = Path(cand)
+                break
     if not path.exists():
         raise FileNotFoundError(f"Dataset config not found at {data_yaml_path}")
     with open(path, "r", encoding="utf-8") as f:
@@ -214,7 +219,7 @@ def select_balanced_calibration_images(
 
 
 def step3_prepare_calibration(
-    data_yaml_path: str = "yolo_dataset/data.yaml",
+    data_yaml_path: str = "datasets/data.yaml",
     calib_out: str = "calibration_video_300_nhwc_float32.npy",
     size: int = 320,
     max_images: int = 300,
@@ -223,7 +228,14 @@ def step3_prepare_calibration(
     strategy: str = "balanced",
     seed: int = 42,
 ):
-    with open(data_yaml_path, "r", encoding="utf-8") as f:
+    yaml_path = Path(data_yaml_path)
+    if not yaml_path.exists() and data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
+        for cand in ("datasets/data.yaml", "datasets/yolo/data.yaml", "yolo_dataset/data.yaml"):
+            if Path(cand).exists():
+                yaml_path = Path(cand)
+                break
+
+    with open(yaml_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     names = data.get("names", {})
@@ -234,7 +246,7 @@ def step3_prepare_calibration(
     else:
         names = {}
 
-    dataset_root = Path(data.get("path", "yolo_dataset"))
+    dataset_root = Path(data.get("path", "datasets" if Path("datasets").exists() else ("datasets/yolo" if Path("datasets/yolo").exists() else "yolo_dataset")))
     val_rel = data.get("val", "images/val")
     train_rel = data.get("train", "images/train")
 
@@ -323,7 +335,7 @@ def step3_prepare_calibration(
 
 
 def step4_generate_labels_json(
-    data_yaml_path: str = "yolo_dataset/data.yaml",
+    data_yaml_path: str = "datasets/data.yaml",
     labels_out: str = None,
     tflite_path: str = "onnx2tf_normalized_full_int8/best_normalized_output_full_integer_quant.tflite",
     model_name: str = "YOLO",
@@ -396,8 +408,8 @@ def main():
     default_calib = "output/calibration_video_300_nhwc_float32.npy" if Path("output").exists() else "calibration_video_300_nhwc_float32.npy"
     parser.add_argument("--input-onnx", default=default_raw_onnx, help="Raw ONNX export input/target")
     parser.add_argument("--output-onnx", default=default_norm_onnx, help="Normalized ONNX output")
-    parser.add_argument("--output-calib", default=default_calib, help="Calibration .npy output")
-    parser.add_argument("--data-yaml", default="yolo_dataset/data.yaml", help="Path to data.yaml")
+    default_data_yaml = "datasets/data.yaml" if Path("datasets/data.yaml").exists() else ("datasets/yolo/data.yaml" if Path("datasets/yolo/data.yaml").exists() else "yolo_dataset/data.yaml")
+    parser.add_argument("--data-yaml", default=default_data_yaml, help="Path to data.yaml")
     parser.add_argument("--output-labels", default=None, help="Path to labels JSON output (default: models/labels/labels_<base_model_name>.json)")
     parser.add_argument("--imgsz", type=int, default=320, help="Model image resolution (default: 320)")
     parser.add_argument("--max-calib", type=int, default=300, help="Max calibration images (default: 300)")

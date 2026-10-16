@@ -143,5 +143,14 @@ def test_default_coco_images_is_zero(monkeypatch):
     monkeypatch.setattr("sys.argv", ["test_server_accuracy.py"])
     args = test_server_accuracy.parse_args()
     assert args.coco_images == 0
+    assert args.frigate_plus_images == 0
+
+
+def test_frigate_plus_images_cli_parsing(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["test_server_accuracy.py", "--frigate-plus-images", "25", "--frigate-plus-dir", "./datasets/frigate-plus"])
+    args = test_server_accuracy.parse_args()
+    assert args.frigate_plus_images == 25
+    assert args.frigate_plus_dir == "./datasets/frigate-plus"
+
 
 

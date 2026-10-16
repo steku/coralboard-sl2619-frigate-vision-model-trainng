@@ -47,13 +47,13 @@ DEFAULT_CVAT_LABELS = [
 PROCESSED_EVENTS_FILE = ".processed_events.json"
 
 
-def load_processed_events(base_dir=None, yolo_dir="yolo_dataset", output_dir=None):
+def load_processed_events(base_dir=None, yolo_dir=None, output_dir=None):
     """
     Collect all event IDs that have already been processed in previous trainings.
     Aggregates from:
     1. Persistent tracking file (.processed_events.json)
-    2. Any existing files in yolo_dataset (train/val images and labels)
-    3. Any existing files in output_dir (e.g. cvat_dataset)
+    2. Any existing files in YOLO datasets (train/val images and labels)
+    3. Any existing files in output_dir (e.g. datasets/staging or cvat_dataset)
     """
     if base_dir is None:
         base_dir = Path(__file__).resolve().parent
@@ -73,14 +73,15 @@ def load_processed_events(base_dir=None, yolo_dir="yolo_dataset", output_dir=Non
         except Exception as e:
             print(f"[WARN] Failed to read {tracker_file}: {e}")
 
-    # 2. Scan yolo_dataset (images & labels)
-    yolo_path = base_dir / yolo_dir
-    if yolo_path.is_dir():
-        for p in yolo_path.glob("**/*.*"):
-            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".txt"):
-                stem = re.sub(r"^t\d+_", "", p.stem)
-                if stem and "." in stem:
-                    processed.add(stem)
+    # 2. Scan YOLO dataset (images & labels)
+    yolo_candidates = [Path(yolo_dir)] if yolo_dir else [base_dir / "datasets" / "yolo", base_dir / "yolo_dataset"]
+    for yolo_path in yolo_candidates:
+        if yolo_path.is_dir():
+            for p in yolo_path.glob("**/*.*"):
+                if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".txt"):
+                    stem = re.sub(r"^t\d+_", "", p.stem)
+                    if stem and "." in stem:
+                        processed.add(stem)
 
     # 3. Scan output_dir (e.g. cvat_dataset)
     if output_dir:
@@ -450,7 +451,7 @@ def load_config(config_path=None):
         "clean": False,
         "snapshot_endpoint": "snapshot-clean.webp",
         "timeout": 10,
-        "output_dir": "./cvat_dataset",
+        "output_dir": "./datasets/staging",
         "cvat_url": "http://192.168.2.1:8085",
         "cvat_user": "admin",
         "cvat_pass": "",
@@ -462,6 +463,8 @@ def load_config(config_path=None):
         "accuracy_report": None,
         "accuracy_test_images": 60,
         "accuracy_coco_images": 0,
+        "accuracy_frigate_plus_images": 0,
+        "frigate_plus_dir": config_utils.load_config().get("frigate_plus", {}).get("path", "./datasets/frigate-plus"),
         "accuracy_metric": "f1_score",
         "server_url": config_utils.get_deployment_settings(cfg).get("server_url", "http://192.168.100.2:5000/v1/vision/detection"),
     }
@@ -494,6 +497,8 @@ def load_config(config_path=None):
                 defaults["accuracy_test_images"] = int(frigate_cfg["accuracy_test_images"])
             if "accuracy_coco_images" in frigate_cfg and frigate_cfg["accuracy_coco_images"] is not None:
                 defaults["accuracy_coco_images"] = int(frigate_cfg["accuracy_coco_images"])
+            if "accuracy_frigate_plus_images" in frigate_cfg and frigate_cfg["accuracy_frigate_plus_images"] is not None:
+                defaults["accuracy_frigate_plus_images"] = int(frigate_cfg["accuracy_frigate_plus_images"])
             if "accuracy_metric" in frigate_cfg and frigate_cfg["accuracy_metric"]:
                 defaults["accuracy_metric"] = str(frigate_cfg["accuracy_metric"]).strip()
             if "server_url" in frigate_cfg and frigate_cfg["server_url"]:
@@ -671,6 +676,17 @@ def parse_args():
         help="Number of random COCO dataset images to include during test_server_accuracy benchmark (default: 0).",
     )
     parser.add_argument(
+        "--accuracy-frigate-plus-images",
+        type=int,
+        default=defaults["accuracy_frigate_plus_images"],
+        help="Number of random Frigate+ dataset images to include during test_server_accuracy benchmark (default: 0).",
+    )
+    parser.add_argument(
+        "--frigate-plus-dir",
+        default=defaults.get("frigate_plus_dir", "./datasets/frigate-plus"),
+        help="Directory containing Frigate+ dataset (default: %(default)s).",
+    )
+    parser.add_argument(
         "--accuracy-metric",
         choices=["f1_score", "recall", "precision", "mean_iou"],
         default=defaults["accuracy_metric"],
@@ -768,6 +784,8 @@ def harvest_from_frigate(
     accuracy_report=None,
     accuracy_test_images=60,
     accuracy_coco_images=0,
+    accuracy_frigate_plus_images=0,
+    frigate_plus_dir="./datasets/frigate-plus",
     accuracy_metric="f1_score",
     server_url=None,
 ):
@@ -816,12 +834,15 @@ def harvest_from_frigate(
             if accuracy_data is None:
                 resolved_url = server_url or config_utils.get_deployment_settings().get("server_url", "http://192.168.100.2:5000/v1/vision/detection")
                 coco_info_str = f" + {accuracy_coco_images} COCO" if accuracy_coco_images > 0 else ""
-                print(f"[INFO] Accuracy-deficit mode active. Running benchmark against vision server: {resolved_url} ({accuracy_test_images} dataset{coco_info_str} images)...")
+                fp_info_str = f" + {accuracy_frigate_plus_images} Frigate+" if accuracy_frigate_plus_images > 0 else ""
+                print(f"[INFO] Accuracy-deficit mode active. Running benchmark against vision server: {resolved_url} ({accuracy_test_images} dataset{coco_info_str}{fp_info_str} images)...")
                 try:
                     accuracy_data = test_server_accuracy.run_accuracy_benchmark(
                         server_url=resolved_url,
                         num_images=accuracy_test_images,
                         coco_images=accuracy_coco_images,
+                        frigate_plus_images=accuracy_frigate_plus_images,
+                        frigate_plus_dir=frigate_plus_dir,
                         output_json=accuracy_report if (accuracy_report and not os.path.isfile(accuracy_report)) else None,
                     )
                 except Exception as e:
@@ -1263,6 +1284,8 @@ def main():
             accuracy_report=args.accuracy_report,
             accuracy_test_images=args.accuracy_test_images,
             accuracy_coco_images=args.accuracy_coco_images,
+            accuracy_frigate_plus_images=args.accuracy_frigate_plus_images,
+            frigate_plus_dir=args.frigate_plus_dir,
             accuracy_metric=args.accuracy_metric,
             server_url=args.server_url,
         )

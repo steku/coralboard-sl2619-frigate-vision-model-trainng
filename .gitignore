@@ -95,9 +95,11 @@ lightning_logs/
 # Datasets, Image Batches & Annotations
 # ------------------------------------------------------------------------------
 # Downloaded snapshots and COCO annotations from Frigate
+datasets/staging/
 cvat_dataset/
 
 # YOLO formatted datasets & configs
+datasets/yolo/
 yolo_dataset/
 *_dataset/
 

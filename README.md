@@ -152,7 +152,7 @@ labels:
   - truck
 
 storage:
-  output_dir: "./cvat_dataset"
+  output_dir: "./datasets/staging"
 
 # ------------------------------------------------------------------------------
 # Model Deployment Settings
@@ -292,12 +292,16 @@ profiles:
 Because the base checkpoints (`yolov8n.pt` and `yolo26n.pt`) are already pre-trained on the exact **canonical 80 COCO classes**, downloading and co-training on external COCO archives (`coco-val2017` / `coco128`) is unnecessary. Instead, the pipeline preserves 100% of the pre-trained backbone, neck, and classification head weights and gently adapts them to your Frigate camera angles, lighting conditions, and $320 \times 320$ resolution:
 
 1. **Canonical COCO-80 ID Alignment (`nc = 80`)**:
-   [`export-cvat-to-yolo.py`](export-cvat-to-yolo.py) and [`config_utils.prepare_training_data_yaml`](config_utils.py) map all CVAT labels to canonical COCO-80 indices (`person` = 0, `car` = 2, `dog` = 16, etc.) and emit all 80 class definitions in `yolo_dataset/data.yaml` referencing only your local CVAT train/val splits:
+   [`export-cvat-to-yolo.py`](export-cvat-to-yolo.py) and [`config_utils.prepare_training_data_yaml`](config_utils.py) map all CVAT labels to canonical COCO-80 indices (`person` = 0, `car` = 2, `dog` = 16, etc.) and emit the composite dataset manifest at `datasets/data.yaml` referencing your local CVAT splits, Frigate+ dataset, and optional COCO reference images:
    ```yaml
    train:
-     - /path/to/yolo_dataset/images/train
+     - /path/to/datasets/yolo/images/train
+     - /path/to/datasets/frigate-plus/images/train
+     - /path/to/datasets/coco/images/val2017
    val:
-     - /path/to/yolo_dataset/images/val
+     - /path/to/datasets/yolo/images/val
+     - /path/to/datasets/frigate-plus/images/val
+     - /path/to/datasets/coco/images/val2017
    names:
      0: person
      1: bicycle
@@ -345,7 +349,7 @@ python frigate-to-cvat.py --camera driveway --labels person car --limit 100
 # Local staging only (skip uploading to CVAT):
 python frigate-to-cvat.py --no-upload
 
-# Upload existing ./cvat_dataset folder directly to CVAT:
+# Upload existing ./datasets/staging folder directly to CVAT:
 python frigate-to-cvat.py --upload-only
 ```
 
@@ -399,7 +403,7 @@ Surveillance cameras routinely capture hundreds of repetitive snapshots of frequ
 1. **Direct In-Memory Benchmark Execution**:
    When `--balance-mode accuracy-deficit` is specified (or set as `frigate.balance_mode: "accuracy-deficit"` in `config.yaml`), [`frigate-to-cvat.py`](frigate-to-cvat.py) dynamically imports [`test_server_accuracy.py`](test_server_accuracy.py) and invokes `test_server_accuracy.run_accuracy_benchmark()` in-process:
    * Sends multipart detection requests to the Coralboard vision server (`--server-url`, default: `http://<CORALBOARD_IP>:5000/v1/vision/detection`).
-   * Evaluates `--accuracy-test-images` (default: 60) against ground truth from `yolo_dataset/`.
+   * Evaluates `--accuracy-test-images` (default: 60) against ground truth from `datasets/yolo/`.
    * Optionally blends `--accuracy-coco-images N` from standard COCO datasets (`coco128` or `coco-val2017`) to anchor evaluation on general object classes.
    * Prints the complete tabular accuracy report to `stdout` and returns structured per-class metrics directly in memory as a Python dictionary (no intermediate disk serialization required).
 
@@ -491,7 +495,7 @@ python report-cvat-balance.py --json
 # 5. Export a specific CVAT task ID:
 ./train.sh --export 4
 
-# 6. Skip CVAT export and train on existing yolo_dataset/:
+# 6. Skip CVAT export and train on existing datasets/yolo/:
 ./train.sh
 
 # 7. Fine-tune / resume from previous best.pt checkpoint:
@@ -506,7 +510,7 @@ python report-cvat-balance.py --json
 # 10. Fast compilation of an existing checkpoint (skip training):
 ./train.sh --compile runs/detect/frigate_coral/yolov8n/weights/best.pt
 
-# 11. Wipe and replace yolo_dataset instead of appending:
+# 11. Wipe and replace datasets/yolo instead of appending:
 ./train.sh --export all --replace
 
 # 12. Auto-clean remote training images on Spark after run completes:
@@ -628,6 +632,12 @@ python test_server_accuracy.py --split val
 # Include 20 images from COCO dataset alongside local dataset images:
 python test_server_accuracy.py --num-images 40 --coco-images 20 --coco-dataset coco-val2017
 
+# Include 30 images from Frigate+ dataset alongside local images:
+python test_server_accuracy.py --num-images 30 --frigate-plus-images 30
+
+# Benchmark strictly against Frigate+ dataset images (0 local images):
+python test_server_accuracy.py --num-images 0 --frigate-plus-images 50
+
 # Benchmark strictly against COCO dataset images (0 local images):
 python test_server_accuracy.py --num-images 0 --coco-images 50
 
@@ -709,7 +719,7 @@ When `train.sh` executes compilation, it carries out the following steps:
 
 1. **Training ($320 \times 320$)**: Fine-tunes the base model (`yolov8n.pt` or `yolo26n.pt`) at strictly $320 \times 320$ resolution using Ultralytics.
 2. **ONNX Normalization ([`prepare_for_onnx2tf.py`](prepare_for_onnx2tf.py))**: Modifies the ONNX graph output channels `0..4` (bounding boxes `cx, cy, w, h`) by dividing them by `320.0` to yield normalized coordinates $[0.0, 1.0]$.
-3. **Representative Calibration Dataset**: Samples images from `yolo_dataset/images/val` and `images/train` using class-balanced stratified sampling, letterboxes them to $320 \times 320$ RGB, and saves `calibration_video_300_nhwc_float32.npy`.
+3. **Representative Calibration Dataset**: Samples images from `datasets/yolo/images/val` and `images/train` using class-balanced stratified sampling, letterboxes them to $320 \times 320$ RGB, and saves `calibration_video_300_nhwc_float32.npy`.
 4. **Full INT8 Quantization (`onnx2tf`)**: Runs `onnx2tf` with `--tflite_backend tf_converter` and calibration data, producing full integer quantized TFLite (`[1, 320, 320, 3] int8` input, `[1, 4+N, 2100] int8` output).
 5. **TOSA MLIR Lowering (`tosa-converter-for-tflite`)**: Lowers the quantized TFLite graph to TOSA MLIR dialect.
 6. **Hardware Vector Compilation (`torq-compile`)**: Compiles TOSA MLIR with `--torq-hw=SL2610` into a hardware binary (`.vmfb`) executing natively inside Astra SL2610 NSS vector slices without LRAM overflow.
@@ -722,7 +732,7 @@ When `train.sh` executes compilation, it carries out the following steps:
 If you prefer to export annotations separately outside of `train.sh`:
 
 ```bash
-# Export latest task and append to yolo_dataset:
+# Export latest task and append to datasets/yolo:
 python export-cvat-to-yolo.py
 
 # Export specific task:
@@ -745,7 +755,7 @@ python export-cvat-to-yolo.py --export all --replace
 | [`report-cvat-balance.py`](report-cvat-balance.py) | **CVAT Dataset Balance Auditor**: Inspects annotation distributions across CVAT tasks/jobs, calculating class deficits, health status, and visual bars. |
 | [`train.sh`](train.sh) | **Unified Pipeline Runner**: Automates CVAT export, local GPU or remote Spark training (`-p spark`, `-p spark-yolo26n`), ONNX export, INT8 quantization, TOSA lowering, Torq compilation, and deployment. |
 | [`config_utils.py`](config_utils.py) | **Configuration Engine**: Parses `config.yaml`, resolves execution profiles, normalizes balance modes, maps COCO-80 classes, and dumps shell variables for `train.sh`. |
-| [`export-cvat-to-yolo.py`](export-cvat-to-yolo.py) | **CVAT Exporter**: Connects to CVAT REST API and exports annotations to `yolo_dataset/` with train/val splits and `data.yaml`. |
+| [`export-cvat-to-yolo.py`](export-cvat-to-yolo.py) | **CVAT Exporter**: Connects to CVAT REST API and exports annotations to `datasets/yolo/` with train/val splits and `data.yaml`. |
 | [`deploy_to_coralboard.sh`](deploy_to_coralboard.sh) | **Model Deployer**: Deploys compiled `.vmfb` and `labels.json` to Coralboard locally or via SCP, with optional SSH service restart and HTTP health checks. |
 | [`test_server_accuracy.py`](test_server_accuracy.py) | **Server Accuracy Benchmark**: Evaluates running vision proxy against dataset images and COCO reference images, measuring precision, recall, F1, and NPU latency. |
 | [`prepare_for_onnx2tf.py`](prepare_for_onnx2tf.py) | **ONNX Normalizer**: Divides ONNX box coordinates by 320.0, generates class-balanced INT8 calibration `.npy`, and writes `labels.json`. |
