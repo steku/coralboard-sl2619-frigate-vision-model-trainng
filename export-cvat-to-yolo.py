@@ -59,8 +59,6 @@ def export_and_prepare_yolo(
     cvat_user: str = None,
     cvat_pass: str = None,
     fallback_classes: list = None,
-    coco_dataset: str = "coco128",
-    datasets_dir: str = "datasets",
 ):
     random.seed(seed)
     out_path = Path(output_dir)
@@ -222,27 +220,17 @@ def export_and_prepare_yolo(
         total_train = len(list((out_path / "images" / "train").glob("*.*")))
         total_val = len(list((out_path / "images" / "val").glob("*.*")))
 
-        # Handle external COCO dataset for co-training
-        if not coco_dataset or coco_dataset not in ("coco128", "coco-val2017"):
-            coco_dataset = "coco128"
-        print(f"\n[INFO] Integrating external COCO dataset '{coco_dataset}' for co-training...")
-        coco_info = config_utils.download_coco_dataset(coco_dataset, target_dir=datasets_dir)
-        print(f"[INFO] External COCO train images: {coco_info['train_dir']}")
-        print(f"[INFO] External COCO val images  : {coco_info['val_dir']}")
-
         # Build names dictionary for data.yaml (canonical COCO-80 classes + any extra custom classes)
         final_names = config_utils.get_coco_80_dict()
         for idx, cname in enumerate(extra_custom_classes):
             final_names[80 + idx] = cname
 
-        # Build train / val paths in data.yaml combining local CVAT dataset and COCO
+        # Build train / val paths in data.yaml referencing local CVAT dataset
         train_list = [
             str((out_path / "images" / "train").resolve()),
-            str(Path(coco_info["train_dir"]).resolve()),
         ]
         val_list = [
             str((out_path / "images" / "val").resolve()),
-            str(Path(coco_info["val_dir"]).resolve()),
         ]
 
         yaml_content = "train:\n"
@@ -273,8 +261,6 @@ def export_and_prepare_yolo(
 def main():
     cfg = load_config()
     default_cvat_url, default_cvat_user, default_cvat_pass = config_utils.get_cvat_credentials(cfg)
-    coco_cfg = config_utils.get_coco_config(cfg)
-    default_coco_dataset = coco_cfg["dataset"]
 
     fallback_classes = None
     if "categories" in cfg and isinstance(cfg["categories"], dict):
@@ -319,18 +305,6 @@ def main():
         help="Wipe and replace existing dataset instead of appending to it (default: append).",
     )
     parser.add_argument(
-        "--coco-dataset",
-        choices=["coco128", "coco-val2017"],
-        default=default_coco_dataset,
-        help=f"External COCO dataset to include for co-training: 'coco128' (~7 MB) or 'coco-val2017' (~850 MB) (default: {default_coco_dataset})",
-    )
-    parser.add_argument(
-        "--datasets-dir",
-        type=str,
-        default="./datasets",
-        help="Directory to store downloaded external datasets (default: ./datasets)",
-    )
-    parser.add_argument(
         "--cvat-url",
         type=str,
         default=default_cvat_url,
@@ -362,9 +336,6 @@ def main():
                 args.cvat_user = c_user
             if args.cvat_pass == default_cvat_pass:
                 args.cvat_pass = c_pass
-            c_coco = config_utils.get_coco_config(custom_cfg)
-            if args.coco_dataset == default_coco_dataset and c_coco.get("dataset"):
-                args.coco_dataset = c_coco["dataset"]
             if "categories" in custom_cfg and isinstance(custom_cfg["categories"], dict):
                 fallback_classes = list(custom_cfg["categories"].keys())
             elif "labels" in custom_cfg and isinstance(custom_cfg["labels"], list):
@@ -380,8 +351,6 @@ def main():
         cvat_user=args.cvat_user,
         cvat_pass=args.cvat_pass,
         fallback_classes=fallback_classes,
-        coco_dataset=args.coco_dataset,
-        datasets_dir=args.datasets_dir,
     )
 
 

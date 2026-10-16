@@ -162,18 +162,13 @@ deployment:
   dir: null
 
 # ------------------------------------------------------------------------------
-# COCO Co-Training Dataset
-# ------------------------------------------------------------------------------
-coco:
-  dataset: "coco-val2017"       # "coco128" (~7 MB) or "coco-val2017" (~850 MB, 5,000 images)
-
-# ------------------------------------------------------------------------------
 # Execution Profiles (train.sh -p <name>)
 # ------------------------------------------------------------------------------
-default_profile: local
+default_profile: torq
 
 profiles:
-  local:                        # Workstation local GPU training (Default)
+  torq:                         # Workstation local GPU training for Torq NPU (Default)
+    target: "torq"
     remote: false
     device: "0"
     batch: 8
@@ -182,8 +177,16 @@ profiles:
     epochs: 80
     patience: 50
     base_model: "yolov8n.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
 
-  spark:                        # Remote NVIDIA DGX / Spark server training via SSH
+  spark-torq:                   # Remote NVIDIA DGX / Spark server training via SSH for Torq NPU
+    target: "torq"
     remote: true
     host: "user@dgx-spark.local"
     remote_dir: "~/frigate-model-training"
@@ -194,9 +197,17 @@ profiles:
     epochs: 300
     patience: 50
     base_model: "yolov8n.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
     clean_images: false
 
-  spark-yolo26n:                # Remote Spark server training using yolo26n architecture
+  spark-torq-yolo26n:           # Remote Spark server training using yolo26n architecture for Torq NPU
+    target: "torq"
     remote: true
     host: "user@dgx-spark.local"
     remote_dir: "~/frigate-model-training"
@@ -207,9 +218,17 @@ profiles:
     epochs: 300
     patience: 50
     base_model: "yolo26n.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
     clean_images: false
 
-  cpu:                          # Local CPU training fallback
+  cpu-torq:                     # Local CPU training fallback for Torq NPU
+    target: "torq"
     remote: false
     device: "cpu"
     batch: 16
@@ -218,48 +237,80 @@ profiles:
     epochs: 80
     patience: 50
     base_model: "yolov8n.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
+
+  nvidia:                       # Local NVIDIA GPU training & ONNX export (skips Torq .vmfb compilation)
+    remote: false
+    target: "nvidia"
+    device: "0"
+    batch: 16
+    workers: 8
+    cache: "ram"
+    epochs: 80
+    patience: 50
+    base_model: "yolov9s.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
+
+  spark-nvidia:                 # Remote Spark GPU training & ONNX export for NVIDIA GPU deployment
+    remote: true
+    target: "nvidia"
+    host: "user@dgx-spark.local"
+    remote_dir: "~/frigate-model-training"
+    device: "0"
+    batch: 64
+    workers: 8
+    cache: "ram"
+    epochs: 300
+    patience: 50
+    base_model: "yolov9s.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
+    clean_images: false
 ```
 
 ---
 
-## COCO Dataset Integration & Co-Training
+## Canonical COCO-80 Domain Adaptation & Gentle Fine-Tuning
 
-Training object detection models exclusively on small custom surveillance datasets often leads to bounding-box jitter, overfitting to static camera backgrounds, and catastrophic forgetting of general object classes. The pipeline incorporates automated **COCO co-training** into both local and remote workflows to act as an anchor regularizer.
+Because the base checkpoints (`yolov8n.pt` and `yolo26n.pt`) are already pre-trained on the exact **canonical 80 COCO classes**, downloading and co-training on external COCO archives (`coco-val2017` / `coco128`) is unnecessary. Instead, the pipeline preserves 100% of the pre-trained backbone, neck, and classification head weights and gently adapts them to your Frigate camera angles, lighting conditions, and $320 \times 320$ resolution:
 
-### Why Co-Train with COCO?
-
-1. **Regularization & Generalization**: Injecting canonical COCO images alongside custom surveillance snapshots stabilizes feature extractors and regression heads, preventing overfitting when surveillance datasets contain fewer than 5,000 images.
-2. **Canonical COCO-80 Alignment**: Preserves canonical 80-class COCO IDs (`person` = 0, `bicycle` = 1, `car` = 2, `dog` = 16, etc.). This ensures output tensors match the expectations of Frigate NVR and the Coralboard vision proxy server without index drift.
-3. **Zero-Overhead Remote Synchronization**: On remote Spark server runs (`-p spark`), the Spark node downloads the configured COCO dataset directly from the web into `datasets/coco/`. This prevents saturating SSH connections transferring hundreds of megabytes of external archives from the local workstation.
-
-### Supported COCO Subsets
-
-Configure the desired dataset in `config.yaml` (`coco.dataset`) or override via CLI (`--coco-dataset NAME`):
-
-* **`coco128`** (~7 MB, 128 images): Compact subset spanning all 80 classes. Ideal for rapid local iteration, compiler quantization verification, and CI pipeline validation.
-* **`coco-val2017`** (~850 MB, 5,000 images): Standard COCO 2017 validation split. Recommended for production training runs on remote Spark / DGX servers.
-
-### How Integration Works Under the Hood
-
-1. **Automatic Download & Archive Caching**:
-   When training or benchmarking begins, [`config_utils.download_coco_dataset`](config_utils.py) checks `datasets/coco/`. If missing, it downloads and unpacks the dataset, reusing cached archives on subsequent runs without redundant downloads.
-2. **Unified Dataset Generation**:
-   [`config_utils.prepare_training_data_yaml`](config_utils.py) creates a unified `yolo_dataset/data.yaml` that merges local CVAT surveillance train/val splits and external COCO dataset images into a single training manifest referencing absolute paths:
+1. **Canonical COCO-80 ID Alignment (`nc = 80`)**:
+   [`export-cvat-to-yolo.py`](export-cvat-to-yolo.py) and [`config_utils.prepare_training_data_yaml`](config_utils.py) map all CVAT labels to canonical COCO-80 indices (`person` = 0, `car` = 2, `dog` = 16, etc.) and emit all 80 class definitions in `yolo_dataset/data.yaml` referencing only your local CVAT train/val splits:
    ```yaml
    train:
      - /path/to/yolo_dataset/images/train
-     - /path/to/datasets/coco/images/val2017
    val:
      - /path/to/yolo_dataset/images/val
-     - /path/to/datasets/coco/images/val2017
    names:
      0: person
      1: bicycle
      ...
      79: toothbrush
    ```
-3. **Accuracy Benchmarking with COCO**:
-   [`test_server_accuracy.py`](test_server_accuracy.py) supports evaluating the running NPU proxy server against standard COCO ground truth (`--coco-images N`, `--coco-dataset NAME`) alongside custom surveillance data, providing an objective baseline of the model's general object recognition capability.
+   This guarantees Ultralytics transfers the entire pre-trained detection head (`cv3` / `one2one_cv3`) without re-initializing output layers, while ensuring validation mAP, early stopping (`patience`), and INT8 PTQ calibration (`prepare_for_onnx2tf.py`) are computed purely on your real Frigate camera snapshots.
+
+2. **Explicit Optimizer & Low Initial Learning Rate (`optimizer: AdamW`, `lr0: 0.0005`)**:
+   In Ultralytics, leaving `optimizer: auto` causes `BaseTrainer.build_optimizer` to **ignore `lr0`** and switch to `MuSGD(lr=0.01)` with a $3\times$ classification head LR boost (`0.03`) when iterations exceed 10,000. Explicitly setting `optimizer: AdamW`, `lr0: 0.0005`, `lrf: 0.01`, and `cos_lr: true` enforces a $20\times$ lower initial learning rate with smooth cosine decay so pre-existing COCO-80 knowledge is not warped.
+
+3. **Strong Warm-Up Phase (`warmup_epochs: 5.0`, `warmup_momentum: 0.5`, `warmup_bias_lr: 0.0`)**:
+   Ramps all parameter groups linearly from `0.0` to `lr0` over 5 epochs (avoiding Ultralytics' default `warmup_bias_lr: 0.1`, which is $200\times$ higher than `lr0` and destabilizes pre-trained head biases during epoch 1).
 
 ---
 
@@ -425,14 +476,14 @@ python report-cvat-balance.py --json
 #### Turnkey Execution Examples:
 
 ```bash
-# 1. Turnkey run on default profile (local GPU), auto-exporting latest CVAT task:
+# 1. Turnkey run on default profile (torq local GPU), auto-exporting latest CVAT task:
 ./train.sh --export
 
-# 2. Turnkey run on remote Spark GPU server, exporting ALL CVAT tasks:
-./train.sh -p spark --export all
+# 2. Turnkey run on remote Spark GPU server for Torq NPU, exporting ALL CVAT tasks:
+./train.sh -p spark-torq --export all
 
-# 3. Train using YOLO26n architecture on Spark:
-./train.sh -p spark-yolo26n --export all
+# 3. Train using YOLO26n architecture on Spark for Torq NPU:
+./train.sh -p spark-torq-yolo26n --export all
 
 # 4. Train with explicit local GPU device and custom epochs:
 ./train.sh --device 0 --epochs 100 --batch 16
@@ -447,10 +498,10 @@ python report-cvat-balance.py --json
 ./train.sh --resume
 
 # 8. Train remotely on Spark only, pull weights, but skip local compilation:
-./train.sh -p spark --skip-compile
+./train.sh -p spark-torq --skip-compile
 
 # 9. Pull latest trained weights from Spark and compile locally (skip training):
-./train.sh -p spark --pull
+./train.sh -p spark-torq --pull
 
 # 10. Fast compilation of an existing checkpoint (skip training):
 ./train.sh --compile runs/detect/frigate_coral/yolov8n/weights/best.pt
@@ -459,14 +510,23 @@ python report-cvat-balance.py --json
 ./train.sh --export all --replace
 
 # 12. Auto-clean remote training images on Spark after run completes:
-./train.sh -p spark --clean-images
+./train.sh -p spark-torq --clean-images
+
+# 13. Train YOLOv9s and export ONNX for NVIDIA GPU (exits early before Torq .vmfb compilation):
+./train.sh -p nvidia
+
+# 14. Train YOLOv9s remotely on Spark and export ONNX locally for NVIDIA GPU:
+./train.sh -p spark-nvidia
+
+# 15. Compile an existing checkpoint to ONNX only for NVIDIA GPU:
+./train.sh -p nvidia --compile runs/detect/frigate_coral/yolov9s/weights/best.pt
 ```
 
 #### Architecture Comparison: YOLOv8n vs. YOLO26n
 
 | Feature | YOLOv8n (`yolov8n.pt`) | YOLO26n (`yolo26n.pt`) |
 | :--- | :--- | :--- |
-| **Recommended Profile** | `local` / `spark` (Default) | `spark-yolo26n` |
+| **Recommended Profile** | `torq` / `spark-torq` (Default) | `spark-torq-yolo26n` |
 | **Loss & Supervision** | Multi-anchor `TaskAlignedAssigner` + DFL | Single-anchor `end2end` scalar regression |
 | **Small-Dataset Convergence** | Fast (~80 epochs, 84.6% mAP@50) | Requires 200–300 epochs (`patience: 50`) |
 | **INT8 Output Scale** | Fine (`scale = 0.00616`), tight confidences | Coarser (`scale = 0.01012`), requires lower detection threshold (~0.15) |

@@ -55,32 +55,97 @@ def test_normalize_balance_mode_invalid():
 
 
 def test_get_profile_resolution():
-    p_local = config_utils.get_profile("local")
-    assert p_local["name"] == "local"
-    assert p_local["remote"] is False
-    assert p_local["batch"] == 8
-    assert p_local["patience"] == 50
+    p_torq = config_utils.get_profile("torq")
+    assert p_torq["name"] == "torq"
+    assert p_torq["target"] == "torq"
+    assert p_torq["remote"] is False
+    assert p_torq["batch"] == 8
+    assert p_torq["patience"] == 50
+    assert p_torq["optimizer"] == "AdamW"
+    assert p_torq["lr0"] == 0.0005
+    assert p_torq["lrf"] == 0.01
+    assert p_torq["cos_lr"] is True
+    assert p_torq["warmup_epochs"] == 5.0
+    assert p_torq["warmup_momentum"] == 0.5
+    assert p_torq["warmup_bias_lr"] == 0.0
 
-    p_spark = config_utils.get_profile("spark")
-    assert p_spark["name"] == "spark"
+    p_spark = config_utils.get_profile("spark-torq")
+    assert p_spark["name"] == "spark-torq"
+    assert p_spark["target"] == "torq"
     assert p_spark["remote"] is True
     assert p_spark["patience"] == 50
+    assert p_spark["optimizer"] == "AdamW"
+    assert p_spark["lr0"] == 0.0005
+    assert p_spark["warmup_epochs"] == 5.0
 
-    # Test hyphen and underscore normalization for spark-yolo26n
-    p_26n_hyphen = config_utils.get_profile("spark-yolo26n")
-    p_26n_under = config_utils.get_profile("spark_yolo26n")
+    # Test hyphen and underscore normalization for spark-torq-yolo26n
+    p_26n_hyphen = config_utils.get_profile("spark-torq-yolo26n")
+    p_26n_under = config_utils.get_profile("spark_torq_yolo26n")
     assert p_26n_hyphen["base_model"] == "yolo26n.pt"
     assert p_26n_under["base_model"] == "yolo26n.pt"
     assert p_26n_hyphen["remote"] is True
     assert p_26n_hyphen["patience"] == 75
     assert p_26n_under["patience"] == 75
+    assert p_26n_hyphen["optimizer"] == "AdamW"
+    assert p_26n_hyphen["lr0"] == 0.0005
+    assert p_26n_hyphen["target"] == "torq"
+
+    p_cpu = config_utils.get_profile("cpu-torq")
+    assert p_cpu["name"] == "cpu-torq"
+    assert p_cpu["target"] == "torq"
+    assert p_cpu["device"] == "cpu"
+
+    # Test nvidia and spark-nvidia profiles
+    p_nvidia = config_utils.get_profile("nvidia")
+    assert p_nvidia["name"] == "nvidia"
+    assert p_nvidia["remote"] is False
+    assert p_nvidia["target"] == "nvidia"
+    assert p_nvidia["base_model"] == "yolov9s.pt"
+    assert p_nvidia["deploy_host"] == ""
+    assert p_nvidia["optimizer"] == "AdamW"
+    assert p_nvidia["lr0"] == 0.0005
+
+    p_spark_nvidia = config_utils.get_profile("spark-nvidia")
+    assert p_spark_nvidia["name"] == "spark-nvidia"
+    assert p_spark_nvidia["remote"] is True
+    assert p_spark_nvidia["target"] == "nvidia"
+    assert p_spark_nvidia["base_model"] == "yolov9s.pt"
+    assert p_spark_nvidia["deploy_host"] == ""
+
+    # Unknown profile (including 'nvidia-spark') raises ValueError
+    with pytest.raises(ValueError, match="Unknown profile"):
+        config_utils.get_profile("nvidia-spark")
+    with pytest.raises(ValueError, match="Unknown profile"):
+        config_utils.get_profile("nonexistent-profile")
 
 
 def test_get_profile_default_patience_fallback(tmp_path):
     custom_yaml = tmp_path / "custom.yaml"
-    custom_yaml.write_text(yaml.safe_dump({"profiles": {"minimal": {"device": "cpu"}}}))
+    custom_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "deployment": {"host": "root@coral:/models"},
+                "profiles": {
+                    "minimal": {"device": "cpu"},
+                    "gpu_onnx": {"target": "onnx"},
+                },
+            }
+        )
+    )
     p = config_utils.get_profile("minimal", config_path=str(custom_yaml))
     assert p["patience"] == 50
+    assert p["target"] == "torq"
+    assert p["base_model"] == "yolov8n.pt"
+    assert p["deploy_host"] == "root@coral:/models"
+    assert p["optimizer"] == "AdamW"
+    assert p["lr0"] == 0.0005
+    assert p["warmup_epochs"] == 5.0
+    assert p["warmup_bias_lr"] == 0.0
+
+    p_gpu = config_utils.get_profile("gpu_onnx", config_path=str(custom_yaml))
+    assert p_gpu["target"] == "nvidia"
+    assert p_gpu["base_model"] == "yolov9s.pt"
+    assert p_gpu["deploy_host"] == ""
 
 
 def test_coco_80_canonical_classes():
@@ -100,12 +165,25 @@ def test_coco_80_canonical_classes():
 
 
 def test_dump_profile_env():
-    env_str = config_utils.dump_profile_env("local")
-    assert "PROFILE_NAME='local'" in env_str
+    env_str = config_utils.dump_profile_env("torq")
+    assert "PROFILE_NAME='torq'" in env_str
     assert "PROFILE_REMOTE='false'" in env_str
+    assert "PROFILE_TARGET='torq'" in env_str
     assert "PROFILE_BATCH=" in env_str
     assert "PROFILE_BASE_MODEL=" in env_str
     assert "PROFILE_PATIENCE='50'" in env_str
+    assert "PROFILE_OPTIMIZER='AdamW'" in env_str
+    assert "PROFILE_LR0='0.0005'" in env_str
+    assert "PROFILE_LRF='0.01'" in env_str
+    assert "PROFILE_COS_LR='True'" in env_str
+    assert "PROFILE_WARMUP_EPOCHS='5.0'" in env_str
+    assert "PROFILE_WARMUP_MOMENTUM='0.5'" in env_str
+    assert "PROFILE_WARMUP_BIAS_LR='0.0'" in env_str
+
+    nvidia_env_str = config_utils.dump_profile_env("nvidia")
+    assert "PROFILE_NAME='nvidia'" in nvidia_env_str
+    assert "PROFILE_TARGET='nvidia'" in nvidia_env_str
+    assert "PROFILE_BASE_MODEL='yolov9s.pt'" in nvidia_env_str
 
 
 def test_prepare_training_data_yaml(tmp_path):
@@ -115,7 +193,6 @@ def test_prepare_training_data_yaml(tmp_path):
     (yolo_dir / "images" / "val").mkdir(parents=True)
 
     data_yaml = config_utils.prepare_training_data_yaml(
-        coco_dataset="coco128",
         workspace_dir=str(tmp_path),
     )
     assert os.path.isfile(data_yaml)
@@ -125,6 +202,9 @@ def test_prepare_training_data_yaml(tmp_path):
 
     assert "train" in data
     assert "val" in data
+    assert data["train"] == [str(yolo_dir / "images" / "train")]
+    assert data["val"] == [str(yolo_dir / "images" / "val")]
     assert "names" in data
     assert len(data["names"]) == 80
     assert data["names"][0] == "person"
+

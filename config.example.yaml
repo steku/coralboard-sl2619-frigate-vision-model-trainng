@@ -122,25 +122,20 @@ deployment:
   service_name: "coralboard-sl2619-vision"
 
 # ------------------------------------------------------------------------------
-# COCO Dataset Co-Training Settings
-# ------------------------------------------------------------------------------
-coco:
-  # External COCO dataset to download and include for co-training:
-  # (CVAT annotations are always automatically remapped to canonical COCO-80 IDs)
-  # Options:
-  #   - "coco128"      : Lightweight anchor dataset (128 images, ~7 MB, 80 classes, default)
-  #   - "coco-val2017" : Validation split dataset (5,000 images, ~850 MB, 80 classes)
-  dataset: "coco128"
-
-# ------------------------------------------------------------------------------
 # Training Execution Profiles (train.sh --profile <name>)
 # ------------------------------------------------------------------------------
+# Since base models (yolov8n.pt / yolo26n.pt) are pre-trained on the exact
+# canonical COCO-80 classes, profiles use a gentle learning rate (lr0: 0.0005)
+# with explicit AdamW and a strong 5-epoch warm-up phase (warmup_bias_lr: 0.0,
+# warmup_momentum: 0.5) to adapt to camera angles and lighting without warping
+# pre-existing representations.
 # Default profile used when --profile is not specified on CLI:
-default_profile: local
+default_profile: torq
 
 profiles:
-  # Local workstation training on local GPU (Default)
-  local:
+  # Local workstation training on local GPU for Torq NPU (Default)
+  torq:
+    target: "torq"
     remote: false
     device: "0"
     batch: 8
@@ -149,9 +144,17 @@ profiles:
     epochs: 80
     patience: 50
     base_model: "yolov8n.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
 
-  # Remote NVIDIA DGX / Spark server training via SSH
-  spark:
+  # Remote NVIDIA DGX / Spark server training via SSH for Torq NPU
+  spark-torq:
+    target: "torq"
     remote: true
     host: "user@dgx-spark.local" # Replace with your user@hostname
     remote_dir: "~/frigate-model-training"
@@ -162,10 +165,18 @@ profiles:
     epochs: 80
     patience: 50
     base_model: "yolov8n.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
     clean_images: false
 
-  # Remote Spark server training using yolo26n architecture
-  spark-yolo26n:
+  # Remote Spark server training using yolo26n architecture for Torq NPU
+  spark-torq-yolo26n:
+    target: "torq"
     remote: true
     host: "user@dgx-spark.local"
     remote_dir: "~/frigate-model-training"
@@ -176,10 +187,59 @@ profiles:
     epochs: 80
     patience: 50
     base_model: "yolo26n.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
     clean_images: false
 
-  # Optional local CPU fallback profile
-  cpu:
+  # NVIDIA Video Card ONNX output profile (Default model: yolov9s.pt)
+  nvidia:
+    target: "nvidia"
+    remote: false
+    device: "0"
+    batch: 8
+    workers: 8
+    cache: "ram"
+    epochs: 80
+    patience: 50
+    base_model: "yolov9s.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
+
+  # Remote Spark server training with NVIDIA Video Card ONNX output (yolov9s.pt)
+  spark-nvidia:
+    target: "nvidia"
+    remote: true
+    host: "user@dgx-spark.local"
+    remote_dir: "~/frigate-model-training"
+    device: "0"
+    batch: 64
+    workers: 8
+    cache: "ram"
+    epochs: 80
+    patience: 50
+    base_model: "yolov9s.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
+    clean_images: false
+
+  # Optional local CPU fallback profile for Torq NPU
+  cpu-torq:
+    target: "torq"
     remote: false
     device: "cpu"
     batch: 16
@@ -188,6 +248,11 @@ profiles:
     epochs: 80
     patience: 50
     base_model: "yolov8n.pt"
-
-
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
 

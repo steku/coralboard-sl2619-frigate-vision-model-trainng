@@ -53,18 +53,26 @@ PATIENCE=50
 BATCH=""                          # Evaluated based on runner if not provided
 WORKERS=8
 CACHE="ram"
+OPTIMIZER="AdamW"
+LR0="0.0005"
+LRF="0.01"
+COS_LR="True"
+WARMUP_EPOCHS="5.0"
+WARMUP_MOMENTUM="0.5"
+WARMUP_BIAS_LR="0.0"
 PROJECT="frigate_coral"
+TARGET_FORMAT="torq"              # 'torq' (.vmfb for Coralboard NPU) or 'nvidia' (.onnx for NVIDIA GPU)
 BASE_MODEL="yolov8n.pt"
 RUN_NAME=""
 LABELS_FILE=""
 OUTPUT_VMFB=""
+OUTPUT_ONNX=""
 FROM_SCRATCH=true
 EXTRA_TRAIN_ARGS=""
 
 # Remote Spark specific defaults
 SPARK_HOST="${SPARK_HOST:-${DGX_HOST:-}}"
 REMOTE_DIR="~/frigate-model-training"
-COCO_DATASET="coco128"
 CLEAN_IMAGES=false
 PULL_ONLY=false
 
@@ -95,35 +103,43 @@ mkdir -p "${OUTPUT_DIR}" "${MODELS_COMPILED_DIR}" "${MODELS_LABELS_DIR}" "${MODE
 usage() {
     local exit_code="${1:-0}"
     echo "=========================================================================="
-    echo "  Frigate Model Training & Torq NPU Compiler (Coralboard SL2619)"
+    echo "  Frigate Model Training & Compiler (Torq NPU & NVIDIA GPU ONNX)"
     echo "=========================================================================="
     echo "Usage: bash $0 [PROFILE] [WORKFLOW] [OPTIONS]"
     echo ""
-    echo "Default (no flags): Runs default profile from config.yaml ('local' GPU),"
+    echo "Default (no flags): Runs default profile from config.yaml ('torq' local GPU),"
     echo "quantizes to INT8, compiles to Torq NPU binary, and deploys if configured."
     echo ""
     echo "Execution Profiles:"
-    echo "  -p, --profile NAME      Select profile from config.yaml (e.g. 'local', 'spark', 'cpu')"
+    echo "  -p, --profile NAME      Select profile from config.yaml (e.g. 'torq', 'spark-torq', 'spark-torq-yolo26n', 'nvidia', 'spark-nvidia', 'cpu-torq')"
     echo ""
     echo "Primary Workflows:"
     echo "  --compile [MODEL.pt]    Skip training; compile checkpoint directly (or latest best.pt)"
     echo "  --export [TASK_ID|all]  Export CVAT task(s) to yolo_dataset/ before training (default: latest)"
-    echo "  --deploy [DEST]         Deploy compiled VMFB & labels to local dir or remote host (user@ip:/path)"
+    echo "  --deploy [DEST]         Deploy compiled model & labels to local dir or remote host (user@ip:/path)"
     echo ""
     echo "Workflow Controls:"
-    echo "  --skip-compile          Train only; skip local INT8 quantization & Torq compilation"
+    echo "  --skip-compile          Train only; skip compilation/export"
     echo "  --skip-deploy           Skip deployment step even if configured in config.yaml"
     echo "  --pull                  Pull latest weights from Spark and compile locally (skip training)"
     echo ""
     echo "Profile Parameter Overrides:"
-    echo "  -m, --base-model MODEL  Base checkpoint / architecture (default: yolov8n.pt)"
+    echo "  -m, --base-model MODEL  Base checkpoint / architecture (default: yolov8n.pt, or yolov9s.pt for nvidia)"
     echo "  --epochs N              Training epochs"
     echo "  --batch N               Batch size"
     echo "  --device DEV            Training device ('0' local GPU, 'cpu', or '0,1' Spark)"
     echo "  --host USER@HOST        SSH destination for remote training"
     echo "  --resume                Resume/fine-tune from previous checkpoint (default: train from scratch)"
-    echo "  --coco-dataset NAME     COCO subset for co-training ('coco128' or 'coco-val2017')"
     echo "  --replace               Wipe and replace existing dataset instead of appending"
+    echo ""
+    echo "Fine-Tuning & Warm-Up Overrides (COCO-80 Domain Adaptation):"
+    echo "  --optimizer NAME        Optimizer (default: AdamW; avoids 'auto' overriding lr0)"
+    echo "  --lr0 FLOAT             Initial learning rate (default: 0.0005)"
+    echo "  --lrf FLOAT             Final learning rate multiplier (default: 0.01)"
+    echo "  --cos-lr BOOL           Use cosine LR scheduler (default: True)"
+    echo "  --warmup-epochs FLOAT   Warm-up epochs (default: 5.0)"
+    echo "  --warmup-momentum FLOAT Initial warm-up momentum (default: 0.5)"
+    echo "  --warmup-bias-lr FLOAT  Initial warm-up bias learning rate (default: 0.0)"
     echo ""
     echo "Advanced & Environment:"
     echo "  -c, --config PATH       Path to YAML configuration file (default: config.yaml)"
@@ -153,7 +169,13 @@ EXPLICIT_PATIENCE=false
 EXPLICIT_WORKERS=false
 EXPLICIT_CACHE=false
 EXPLICIT_BASE_MODEL=false
-EXPLICIT_COCO=false
+EXPLICIT_OPTIMIZER=false
+EXPLICIT_LR0=false
+EXPLICIT_LRF=false
+EXPLICIT_COS_LR=false
+EXPLICIT_WARMUP_EPOCHS=false
+EXPLICIT_WARMUP_MOMENTUM=false
+EXPLICIT_WARMUP_BIAS_LR=false
 EXPLICIT_CLEAN_IMAGES=false
 EXPLICIT_DEPLOY_HOST=false
 EXPLICIT_DEPLOY_DIR=false
@@ -189,11 +211,6 @@ while [[ $# -gt 0 ]]; do
         --replace)
             DO_APPEND=false
             shift
-            ;;
-        --coco-dataset|--coco)
-            COCO_DATASET="$2"
-            EXPLICIT_COCO=true
-            shift 2
             ;;
         --data-yaml)
             DATA_YAML="$2"
@@ -249,6 +266,41 @@ while [[ $# -gt 0 ]]; do
         --patience)
             PATIENCE="$2"
             EXPLICIT_PATIENCE=true
+            shift 2
+            ;;
+        --optimizer)
+            OPTIMIZER="$2"
+            EXPLICIT_OPTIMIZER=true
+            shift 2
+            ;;
+        --lr0)
+            LR0="$2"
+            EXPLICIT_LR0=true
+            shift 2
+            ;;
+        --lrf)
+            LRF="$2"
+            EXPLICIT_LRF=true
+            shift 2
+            ;;
+        --cos-lr)
+            COS_LR="$2"
+            EXPLICIT_COS_LR=true
+            shift 2
+            ;;
+        --warmup-epochs)
+            WARMUP_EPOCHS="$2"
+            EXPLICIT_WARMUP_EPOCHS=true
+            shift 2
+            ;;
+        --warmup-momentum)
+            WARMUP_MOMENTUM="$2"
+            EXPLICIT_WARMUP_MOMENTUM=true
+            shift 2
+            ;;
+        --warmup-bias-lr)
+            WARMUP_BIAS_LR="$2"
+            EXPLICIT_WARMUP_BIAS_LR=true
             shift 2
             ;;
         --extra-args)
@@ -326,10 +378,14 @@ source "${VIRTUAL_ENV_PATH}/bin/activate"
 # Load Configuration Profile & Apply Overrides
 # ------------------------------------------------------------------------------
 if [[ -f "${CONFIG_FILE}" ]]; then
-    eval "$(python3 config_utils.py --profile-env "${PROFILE}" --config "${CONFIG_FILE}" 2>/dev/null || true)"
+    if ! PROFILE_ENV_OUT="$(python3 config_utils.py --profile-env "${PROFILE}" --config "${CONFIG_FILE}")"; then
+        exit 1
+    fi
+    eval "${PROFILE_ENV_OUT}"
 fi
 
-PROFILE_NAME="${PROFILE_NAME:-local}"
+PROFILE_NAME="${PROFILE_NAME:-torq}"
+TARGET_FORMAT="${PROFILE_TARGET:-torq}"
 
 if [[ "${PROFILE_REMOTE:-false}" == "true" || "${PULL_ONLY}" == "true" || "${EXPLICIT_HOST}" == "true" ]]; then
     RUNNER="spark"
@@ -369,8 +425,32 @@ if [[ "${EXPLICIT_BASE_MODEL}" == "false" && -n "${PROFILE_BASE_MODEL}" ]]; then
     BASE_MODEL="${PROFILE_BASE_MODEL}"
 fi
 
-if [[ "${EXPLICIT_COCO}" == "false" && -n "${PROFILE_COCO_DATASET}" ]]; then
-    COCO_DATASET="${PROFILE_COCO_DATASET}"
+if [[ "${EXPLICIT_OPTIMIZER}" == "false" && -n "${PROFILE_OPTIMIZER}" ]]; then
+    OPTIMIZER="${PROFILE_OPTIMIZER}"
+fi
+
+if [[ "${EXPLICIT_LR0}" == "false" && -n "${PROFILE_LR0}" ]]; then
+    LR0="${PROFILE_LR0}"
+fi
+
+if [[ "${EXPLICIT_LRF}" == "false" && -n "${PROFILE_LRF}" ]]; then
+    LRF="${PROFILE_LRF}"
+fi
+
+if [[ "${EXPLICIT_COS_LR}" == "false" && -n "${PROFILE_COS_LR}" ]]; then
+    COS_LR="${PROFILE_COS_LR}"
+fi
+
+if [[ "${EXPLICIT_WARMUP_EPOCHS}" == "false" && -n "${PROFILE_WARMUP_EPOCHS}" ]]; then
+    WARMUP_EPOCHS="${PROFILE_WARMUP_EPOCHS}"
+fi
+
+if [[ "${EXPLICIT_WARMUP_MOMENTUM}" == "false" && -n "${PROFILE_WARMUP_MOMENTUM}" ]]; then
+    WARMUP_MOMENTUM="${PROFILE_WARMUP_MOMENTUM}"
+fi
+
+if [[ "${EXPLICIT_WARMUP_BIAS_LR}" == "false" && -n "${PROFILE_WARMUP_BIAS_LR}" ]]; then
+    WARMUP_BIAS_LR="${PROFILE_WARMUP_BIAS_LR}"
 fi
 
 if [[ "${EXPLICIT_CLEAN_IMAGES}" == "false" && "${PROFILE_CLEAN_IMAGES:-false}" == "true" ]]; then
@@ -381,11 +461,11 @@ if [[ -n "${PROFILE_REMOTE_DIR}" ]]; then
     REMOTE_DIR="${PROFILE_REMOTE_DIR}"
 fi
 
-if [[ "${EXPLICIT_DEPLOY_HOST}" == "false" && -z "${DEPLOY_HOST}" && -n "${PROFILE_DEPLOY_HOST}" ]]; then
+if [[ "${EXPLICIT_DEPLOY_HOST}" == "false" && -z "${DEPLOY_HOST}" && -n "${PROFILE_DEPLOY_HOST}" && "${TARGET_FORMAT}" != "nvidia" ]]; then
     DEPLOY_HOST="${PROFILE_DEPLOY_HOST}"
 fi
 
-if [[ "${EXPLICIT_DEPLOY_DIR}" == "false" && -z "${DEPLOY_DIR}" && -n "${PROFILE_DEPLOY_DIR}" ]]; then
+if [[ "${EXPLICIT_DEPLOY_DIR}" == "false" && -z "${DEPLOY_DIR}" && -n "${PROFILE_DEPLOY_DIR}" && "${TARGET_FORMAT}" != "nvidia" ]]; then
     DEPLOY_DIR="${PROFILE_DEPLOY_DIR}"
 fi
 
@@ -406,6 +486,10 @@ if [[ -z "${OUTPUT_VMFB}" ]]; then
     OUTPUT_VMFB="${MODELS_COMPILED_DIR}/custom_${RUN_NAME_STEM}.vmfb"
 fi
 
+if [[ -z "${OUTPUT_ONNX}" ]]; then
+    OUTPUT_ONNX="${MODELS_COMPILED_DIR}/custom_${RUN_NAME_STEM}.onnx"
+fi
+
 # Resolve deployment overrides
 if [[ "${SKIP_DEPLOY}" == "true" ]]; then
     DEPLOY_HOST=""
@@ -420,16 +504,23 @@ if [[ "${RUNNER}" == "spark" ]]; then
 else
     echo "  Profile:       ${PROFILE_NAME^^} (Local GPU, Device: ${DEVICE})"
 fi
+if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
+    echo "  Target:        NVIDIA Video Card (ONNX -> ${OUTPUT_ONNX})"
+else
+    echo "  Target:        Coralboard SL2619 Torq NPU (VMFB -> ${OUTPUT_VMFB})"
+fi
 echo "  Hyperparams:   Batch: ${BATCH}, Workers: ${WORKERS}, Epochs: ${EPOCHS}, Patience: ${PATIENCE}, Cache: ${CACHE}"
+echo "  Fine-Tuning:   Optimizer: ${OPTIMIZER}, lr0: ${LR0}, lrf: ${LRF}, cos_lr: ${COS_LR}"
+echo "  Warm-Up:       Epochs: ${WARMUP_EPOCHS}, Momentum: ${WARMUP_MOMENTUM}, Bias LR: ${WARMUP_BIAS_LR}"
 echo "  Base Model:    ${BASE_MODEL} (Run Name: ${RUN_NAME})"
-echo "  Resolution:    ${IMGSZ}x${IMGSZ} (strictly required for Coralboard SL2619)"
+echo "  Resolution:    ${IMGSZ}x${IMGSZ}"
 echo "=========================================================================="
 
 # ------------------------------------------------------------------------------
 # Tool Availability Verification
 # ------------------------------------------------------------------------------
 REQUIRED_TOOLS=(python3 yolo)
-if [[ "${SKIP_COMPILE}" == "false" ]]; then
+if [[ "${SKIP_COMPILE}" == "false" && "${TARGET_FORMAT}" == "torq" ]]; then
     REQUIRED_TOOLS+=(onnx2tf tosa-converter-for-tflite torq-compile)
 fi
 
@@ -459,9 +550,6 @@ if [[ "${DO_EXPORT}" == "true" ]]; then
     fi
     if [[ "${DO_APPEND}" == "false" ]]; then
         EXPORT_CMD+=(--replace)
-    fi
-    if [[ -n "${COCO_DATASET}" ]]; then
-        EXPORT_CMD+=(--coco-dataset "${COCO_DATASET}")
     fi
     DATA_DIR="$(dirname "${DATA_YAML}")"
     if [[ "${DATA_DIR}" != "." && "${DATA_DIR}" != "yolo_dataset" ]]; then
@@ -559,7 +647,6 @@ elif [[ "${RUNNER}" == "spark" ]]; then
                 "${SPARK_HOST}:${REMOTE_DIR}/"
 
             rsync -avz --delete \
-                --exclude="coco*" \
                 --exclude="*.zip" \
                 --exclude="*.tar*" \
                 --exclude="__pycache__" \
@@ -581,18 +668,18 @@ elif [[ "${RUNNER}" == "spark" ]]; then
             scp "${BASE_MODEL}" "${SPARK_HOST}:${REMOTE_DIR}/models/base/"
         fi
 
-        # Prepare remote COCO dataset
-        log_info "Preparing remote COCO dataset '${COCO_DATASET}' on Spark..."
+        # Prepare remote data.yaml with canonical COCO-80 classes and remote paths
+        log_info "Generating canonical COCO-80 data.yaml on Spark..."
         ssh "${SPARK_HOST}" "
             set -e
             cd \"${REMOTE_DIR}\"
             source \"${REMOTE_DIR}/venv/bin/activate\"
             export PYTHONPATH=\"${REMOTE_DIR}:\${PYTHONPATH:-}\"
-            python3 -c \"import config_utils; config_utils.prepare_training_data_yaml('${COCO_DATASET}', '${REMOTE_DIR}')\"
+            python3 -c \"import config_utils; config_utils.prepare_training_data_yaml('${REMOTE_DIR}')\"
         "
 
         # Launch training on Spark
-        log_info "Launching YOLOv8 training on ${SPARK_HOST} (device=${DEVICE}, batch=${BATCH}, workers=${WORKERS}, cache=${CACHE}, epochs=${EPOCHS})..."
+        log_info "Launching YOLO fine-tuning on ${SPARK_HOST} (device=${DEVICE}, batch=${BATCH}, optimizer=${OPTIMIZER}, lr0=${LR0}, warmup=${WARMUP_EPOCHS})..."
         ssh -t "${SPARK_HOST}" "
             set -e
             cd \"${REMOTE_DIR}\"
@@ -624,6 +711,13 @@ elif [[ "${RUNNER}" == "spark" ]]; then
                 workers=${WORKERS} \
                 cache=${CACHE} \
                 patience=${PATIENCE} \
+                optimizer='${OPTIMIZER}' \
+                lr0=${LR0} \
+                lrf=${LRF} \
+                cos_lr=${COS_LR} \
+                warmup_epochs=${WARMUP_EPOCHS} \
+                warmup_momentum=${WARMUP_MOMENTUM} \
+                warmup_bias_lr=${WARMUP_BIAS_LR} \
                 device='${DEVICE}' \
                 project='frigate_coral' \
                 name='${RUN_NAME}' \
@@ -658,6 +752,10 @@ else
     # --------------------------------------------------------------------------
     # Local GPU/CPU Training (Default)
     # --------------------------------------------------------------------------
+    if [[ "${DATA_YAML}" == "yolo_dataset/data.yaml" && -d "yolo_dataset/images/train" ]]; then
+        python3 -c "import config_utils; config_utils.prepare_training_data_yaml('.')"
+    fi
+
     if [[ ! -f "${DATA_YAML}" ]]; then
         log_err "Dataset configuration file '${DATA_YAML}' not found. Run with --export first."
         exit 1
@@ -686,7 +784,7 @@ else
         fi
     fi
 
-    log_info "Executing: yolo detect train on device='${DEVICE}'..."
+    log_info "Executing: yolo detect train on device='${DEVICE}' (optimizer=${OPTIMIZER}, lr0=${LR0}, warmup=${WARMUP_EPOCHS})..."
     yolo detect train \
         data="${DATA_YAML}" \
         model="${START_MODEL}" \
@@ -696,6 +794,13 @@ else
         workers="${WORKERS}" \
         cache="${CACHE}" \
         patience="${PATIENCE}" \
+        optimizer="${OPTIMIZER}" \
+        lr0="${LR0}" \
+        lrf="${LRF}" \
+        cos_lr="${COS_LR}" \
+        warmup_epochs="${WARMUP_EPOCHS}" \
+        warmup_momentum="${WARMUP_MOMENTUM}" \
+        warmup_bias_lr="${WARMUP_BIAS_LR}" \
         device="${DEVICE}" \
         project="${PROJECT}" \
         name="${RUN_NAME}" \
@@ -717,7 +822,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Step 3: Local INT8 Quantization & Torq Compilation
+# Step 3: Model Export & Target Compilation
 # ------------------------------------------------------------------------------
 if [[ "${SKIP_COMPILE}" == "true" ]]; then
     log_info "--skip-compile specified: exiting pipeline before compilation."
@@ -731,17 +836,22 @@ fi
 
 echo ""
 echo "=========================================================================="
-echo "  Step 3: Torq NPU Export, Quantization & Compilation (${IMGSZ}x${IMGSZ})"
+if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
+    echo "  Step 3: NVIDIA GPU ONNX Export (${IMGSZ}x${IMGSZ})"
+else
+    echo "  Step 3: Torq NPU Export, Quantization & Compilation (${IMGSZ}x${IMGSZ})"
+fi
 echo "=========================================================================="
 
 EXPORTED_ONNX="${WEIGHTS_PATH%.pt}.onnx"
-if [[ ! -f "${EXPORTED_ONNX}" ]]; then
+if [[ ! -f "${EXPORTED_ONNX}" || "${WEIGHTS_PATH}" -nt "${EXPORTED_ONNX}" ]]; then
     log_info "Exporting PyTorch model to ONNX (${IMGSZ}x${IMGSZ})..."
     yolo export \
         model="${WEIGHTS_PATH}" \
         format=onnx \
         imgsz="${IMGSZ}" \
         dynamic=False \
+        simplify=True \
         opset=17
 fi
 
@@ -752,81 +862,91 @@ fi
 
 cp -f "${EXPORTED_ONNX}" "${OUTPUT_DIR}/best.onnx"
 
-log_info "Normalizing ONNX coordinates and generating calibration dataset..."
-python3 prepare_for_onnx2tf.py \
-    --skip-export \
-    --input-onnx "${OUTPUT_DIR}/best.onnx" \
-    --output-onnx "${OUTPUT_DIR}/best_normalized_output.onnx" \
-    --output-calib "${OUTPUT_DIR}/calibration_video_300_nhwc_float32.npy" \
-    --output-labels "${LABELS_FILE}" \
-    --data-yaml "${DATA_YAML}" \
-    --imgsz "${IMGSZ}" \
-    --base-model-name "${BASE_MODEL_NAME}"
+if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
+    mkdir -p "$(dirname "${OUTPUT_ONNX}")"
+    cp -f "${EXPORTED_ONNX}" "${OUTPUT_ONNX}"
+    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}')"
+    log_success "NVIDIA GPU ONNX model generated successfully: ${OUTPUT_ONNX} ($(du -h "${OUTPUT_ONNX}" | cut -f1))"
+    log_info "Target is NVIDIA GPU ('${TARGET_FORMAT}'): skipping Torq NPU INT8 quantization and .vmfb compilation."
+    PRIMARY_ARTIFACT="${OUTPUT_ONNX}"
+else
+    log_info "Normalizing ONNX coordinates and generating calibration dataset..."
+    python3 prepare_for_onnx2tf.py \
+        --skip-export \
+        --input-onnx "${OUTPUT_DIR}/best.onnx" \
+        --output-onnx "${OUTPUT_DIR}/best_normalized_output.onnx" \
+        --output-calib "${OUTPUT_DIR}/calibration_video_300_nhwc_float32.npy" \
+        --output-labels "${LABELS_FILE}" \
+        --data-yaml "${DATA_YAML}" \
+        --imgsz "${IMGSZ}" \
+        --base-model-name "${BASE_MODEL_NAME}"
 
-log_info "Executing Full INT8 Quantization via onnx2tf..."
-rm -rf "${OUTPUT_DIR}/onnx2tf_normalized_full_int8"
+    log_info "Executing Full INT8 Quantization via onnx2tf..."
+    rm -rf "${OUTPUT_DIR}/onnx2tf_normalized_full_int8"
 
-onnx2tf \
-    -i "${OUTPUT_DIR}/best_normalized_output.onnx" \
-    -o "${OUTPUT_DIR}/onnx2tf_normalized_full_int8" \
-    -oiqt -iqd int8 -oqd int8 \
-    --tflite_backend tf_converter \
-    -cind images "${OUTPUT_DIR}/calibration_video_300_nhwc_float32.npy" \
-    "[[[[0.0,0.0,0.0]]]]" "[[[[1.0,1.0,1.0]]]]"
+    onnx2tf \
+        -i "${OUTPUT_DIR}/best_normalized_output.onnx" \
+        -o "${OUTPUT_DIR}/onnx2tf_normalized_full_int8" \
+        -oiqt -iqd int8 -oqd int8 \
+        --tflite_backend tf_converter \
+        -cind images "${OUTPUT_DIR}/calibration_video_300_nhwc_float32.npy" \
+        "[[[[0.0,0.0,0.0]]]]" "[[[[1.0,1.0,1.0]]]]"
 
-FULL_INT8_TFLITE="${OUTPUT_DIR}/onnx2tf_normalized_full_int8/best_normalized_output_full_integer_quant.tflite"
-if [[ ! -f "${FULL_INT8_TFLITE}" ]]; then
-    log_err "onnx2tf failed to generate full integer quantized TFLite at ${FULL_INT8_TFLITE}"
-    exit 1
+    FULL_INT8_TFLITE="${OUTPUT_DIR}/onnx2tf_normalized_full_int8/best_normalized_output_full_integer_quant.tflite"
+    if [[ ! -f "${FULL_INT8_TFLITE}" ]]; then
+        log_err "onnx2tf failed to generate full integer quantized TFLite at ${FULL_INT8_TFLITE}"
+        exit 1
+    fi
+
+    # Update labels with exact TFLite quantization scales/zero points
+    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '${FULL_INT8_TFLITE}', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}')"
+
+    log_info "Converting TFLite to TOSA MLIR..."
+    TOSA_MLIR="${OUTPUT_DIR}/custom_${RUN_NAME_STEM}_normalized_full_integer.tosa.mlir"
+    tosa-converter-for-tflite \
+        "${FULL_INT8_TFLITE}" \
+        --text \
+        -o "${TOSA_MLIR}"
+
+    log_info "Compiling TOSA MLIR for Synaptics Astra SL2610 Torq NPU..."
+    torq-compile \
+        --torq-hw=SL2610 \
+        "${TOSA_MLIR}" \
+        -o "${OUTPUT_VMFB}"
+
+    if [[ ! -f "${OUTPUT_VMFB}" ]]; then
+        log_err "torq-compile failed to produce VMFB binary at ${OUTPUT_VMFB}"
+        exit 1
+    fi
+    log_success "Torq VMFB generated successfully: ${OUTPUT_VMFB} ($(du -h "${OUTPUT_VMFB}" | cut -f1))"
+    PRIMARY_ARTIFACT="${OUTPUT_VMFB}"
 fi
-
-# Update labels with exact TFLite quantization scales/zero points
-python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '${FULL_INT8_TFLITE}', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}')"
-
-log_info "Converting TFLite to TOSA MLIR..."
-TOSA_MLIR="${OUTPUT_DIR}/custom_${RUN_NAME_STEM}_normalized_full_integer.tosa.mlir"
-tosa-converter-for-tflite \
-    "${FULL_INT8_TFLITE}" \
-    --text \
-    -o "${TOSA_MLIR}"
-
-log_info "Compiling TOSA MLIR for Synaptics Astra SL2610 Torq NPU..."
-torq-compile \
-    --torq-hw=SL2610 \
-    "${TOSA_MLIR}" \
-    -o "${OUTPUT_VMFB}"
-
-if [[ ! -f "${OUTPUT_VMFB}" ]]; then
-    log_err "torq-compile failed to produce VMFB binary at ${OUTPUT_VMFB}"
-    exit 1
-fi
-log_success "Torq VMFB generated successfully: ${OUTPUT_VMFB} ($(du -h "${OUTPUT_VMFB}" | cut -f1))"
 
 # ------------------------------------------------------------------------------
-# Step 4: Optional Deployment to Coralboard
+# Step 4: Optional Deployment
 # ------------------------------------------------------------------------------
 if [[ "${SKIP_DEPLOY}" == "false" ]]; then
-    OUTPUT_VMFB_BASENAME="$(basename "${OUTPUT_VMFB}")"
+    ARTIFACT_BASENAME="$(basename "${PRIMARY_ARTIFACT}")"
     LABELS_BASENAME="$(basename "${LABELS_FILE}")"
 
     if [[ -n "${DEPLOY_DIR}" ]]; then
         echo ""
         log_info "Deploying artifacts to local directory: ${DEPLOY_DIR}..."
         mkdir -p "${DEPLOY_DIR}"
-        cp -f "${OUTPUT_VMFB}" "${DEPLOY_DIR}/${OUTPUT_VMFB_BASENAME}"
+        cp -f "${PRIMARY_ARTIFACT}" "${DEPLOY_DIR}/${ARTIFACT_BASENAME}"
         cp -f "${LABELS_FILE}" "${DEPLOY_DIR}/${LABELS_BASENAME}"
         cp -f "${LABELS_FILE}" "${DEPLOY_DIR}/labels.json"
-        log_success "Deployed ${OUTPUT_VMFB_BASENAME} and ${LABELS_BASENAME} to ${DEPLOY_DIR}/"
+        log_success "Deployed ${ARTIFACT_BASENAME} and ${LABELS_BASENAME} to ${DEPLOY_DIR}/"
     fi
 
     if [[ -n "${DEPLOY_HOST}" ]]; then
         echo ""
         CLEAN_HOST="${DEPLOY_HOST%/}"
         log_info "Deploying artifacts via SCP to ${CLEAN_HOST}..."
-        scp "${OUTPUT_VMFB}" "${CLEAN_HOST}/${OUTPUT_VMFB_BASENAME}"
+        scp "${PRIMARY_ARTIFACT}" "${CLEAN_HOST}/${ARTIFACT_BASENAME}"
         scp "${LABELS_FILE}" "${CLEAN_HOST}/${LABELS_BASENAME}"
         scp "${LABELS_FILE}" "${CLEAN_HOST}/labels.json"
-        log_success "Deployed ${OUTPUT_VMFB_BASENAME} and ${LABELS_BASENAME} (and labels.json) via SCP to ${CLEAN_HOST}!"
+        log_success "Deployed ${ARTIFACT_BASENAME} and ${LABELS_BASENAME} (and labels.json) via SCP to ${CLEAN_HOST}!"
     fi
 fi
 
@@ -835,10 +955,17 @@ fi
 # ------------------------------------------------------------------------------
 echo ""
 echo "=========================================================================="
-echo -e "${GREEN}  PIPELINE COMPLETE - MODEL READY FOR NPU INFERENCE!${NC}"
-echo "=========================================================================="
-echo "Artifacts Generated:"
-echo "  1. Hardware Binary : ${OUTPUT_VMFB} ($(du -h "${OUTPUT_VMFB}" | cut -f1))"
+if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
+    echo -e "${GREEN}  PIPELINE COMPLETE - ONNX MODEL READY FOR NVIDIA GPU INFERENCE!${NC}"
+    echo "=========================================================================="
+    echo "Artifacts Generated:"
+    echo "  1. ONNX Model      : ${OUTPUT_ONNX} ($(du -h "${OUTPUT_ONNX}" | cut -f1))"
+else
+    echo -e "${GREEN}  PIPELINE COMPLETE - MODEL READY FOR NPU INFERENCE!${NC}"
+    echo "=========================================================================="
+    echo "Artifacts Generated:"
+    echo "  1. Hardware Binary : ${OUTPUT_VMFB} ($(du -h "${OUTPUT_VMFB}" | cut -f1))"
+fi
 echo "  2. Label Metadata  : ${LABELS_FILE}"
 echo "  3. PyTorch Weights : ${WEIGHTS_PATH}"
 echo "=========================================================================="

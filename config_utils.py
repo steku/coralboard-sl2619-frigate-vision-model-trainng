@@ -375,42 +375,45 @@ def download_coco_dataset(dataset_name: str, target_dir: str = "datasets") -> Di
         raise ValueError(f"Unsupported COCO dataset: '{dataset_name}'. Choose 'coco128' or 'coco-val2017'.")
 
 
-def prepare_training_data_yaml(coco_dataset: str = "coco128", workspace_dir: str = ".") -> str:
+def prepare_training_data_yaml(workspace_dir: str = ".", **_kwargs) -> str:
     """
-    Prepare COCO dataset and generate canonical 80-class data.yaml referencing
-    both the local CVAT images and external COCO images with absolute paths.
+    Generate canonical 80-class data.yaml referencing the local CVAT train/val
+    images with absolute paths (preserving any custom classes >= 80).
     """
-    import yaml
-
     workspace = Path(workspace_dir).expanduser().resolve()
-    target_datasets = workspace / "datasets"
+    out_yaml = workspace / "yolo_dataset" / "data.yaml"
 
-    print(f"[DATASET] Checking external COCO dataset: {coco_dataset}...")
-    coco_info = download_coco_dataset(coco_dataset, target_dir=str(target_datasets))
-    print(f"[DATASET] COCO Train Directory: {coco_info['train_dir']}")
-    print(f"[DATASET] COCO Val Directory  : {coco_info['val_dir']}")
+    names = get_coco_80_dict()
+    if out_yaml.is_file():
+        try:
+            with open(out_yaml, "r", encoding="utf-8") as f:
+                existing = yaml.safe_load(f) or {}
+            existing_names = existing.get("names", {})
+            if isinstance(existing_names, dict):
+                for k, v in existing_names.items():
+                    if int(k) >= 80:
+                        names[int(k)] = str(v)
+        except Exception:
+            pass
 
     train_paths = [
         str(workspace / "yolo_dataset" / "images" / "train"),
-        str(Path(coco_info["train_dir"]).resolve()),
     ]
     val_paths = [
         str(workspace / "yolo_dataset" / "images" / "val"),
-        str(Path(coco_info["val_dir"]).resolve()),
     ]
 
     data_dict = {
         "train": train_paths,
         "val": val_paths,
-        "names": get_coco_80_dict(),
+        "names": names,
     }
 
-    out_yaml = workspace / "yolo_dataset" / "data.yaml"
     out_yaml.parent.mkdir(parents=True, exist_ok=True)
     with open(out_yaml, "w", encoding="utf-8") as f:
         yaml.safe_dump(data_dict, f, sort_keys=False)
 
-    print(f"[DATASET] Unified data.yaml written to {out_yaml}")
+    print(f"[DATASET] Canonical COCO-80 data.yaml written to {out_yaml}")
     return str(out_yaml)
 
 
@@ -430,40 +433,25 @@ def get_profile(
     if cfg is None:
         cfg = load_config(config_path)
 
-    default_profile = str(cfg.get("default_profile") or "local").strip().lower()
+    default_profile = str(cfg.get("default_profile") or "torq").strip().lower()
     target_name = (profile_name or default_profile).strip().lower()
 
     profiles = cfg.get("profiles", {}) if isinstance(cfg.get("profiles"), dict) else {}
-    p_raw = profiles.get(target_name) or profiles.get(target_name.replace("_", "-")) or profiles.get(target_name.replace("-", "_"))
-    p_data = p_raw if isinstance(p_raw, dict) else {}
+    p_raw = (
+        profiles.get(target_name)
+        or profiles.get(target_name.replace("_", "-"))
+        or profiles.get(target_name.replace("-", "_"))
+    )
 
-    # Backward compatibility fallback for legacy config schema
-    if not p_data:
-        if target_name in ("spark", "remote"):
-            legacy_rem = cfg.get("remote_training", {}) or {}
-            p_data = {
-                "remote": True,
-                "host": legacy_rem.get("host"),
-                "remote_dir": legacy_rem.get("remote_dir", "~/frigate-model-training"),
-                "device": str(legacy_rem.get("device", "0")),
-                "batch": legacy_rem.get("batch", 64),
-                "workers": legacy_rem.get("workers", 8),
-                "cache": legacy_rem.get("cache", "ram"),
-                "clean_images": legacy_rem.get("clean_images", False),
-                "patience": legacy_rem.get("patience", 50),
-            }
-        else:
-            legacy_trn = cfg.get("training", {}) or {}
-            p_data = {
-                "remote": False,
-                "device": str(legacy_trn.get("device", "0")),
-                "batch": legacy_trn.get("batch", 8),
-                "workers": legacy_trn.get("workers", 8),
-                "cache": legacy_trn.get("cache", "ram"),
-                "epochs": legacy_trn.get("epochs", 80),
-                "patience": legacy_trn.get("patience", 50),
-                "base_model": legacy_trn.get("base_model", "yolov8n.pt"),
-            }
+    if not isinstance(p_raw, dict):
+        if profile_name and profiles:
+            available = ", ".join(sorted(profiles.keys()))
+            raise ValueError(
+                f"Unknown profile '{profile_name}' in config.yaml. Available profiles: {available}"
+            )
+        p_data: Dict[str, Any] = {}
+    else:
+        p_data = p_raw
 
     is_remote = bool(p_data.get("remote", False))
     host = str(p_data.get("host") or "")
@@ -497,18 +485,63 @@ def get_profile(
     except (TypeError, ValueError):
         patience = 50
 
-    base_model = str(p_data.get("base_model") or "yolov8n.pt")
+    raw_target = str(
+        p_data.get("target")
+        or p_data.get("output_format")
+        or ("nvidia" if "nvidia" in target_name or target_name == "onnx" else "torq")
+    ).strip().lower()
+    if raw_target in ("nvidia", "onnx", "gpu", "tensorrt"):
+        target = "nvidia"
+    else:
+        target = "torq"
+
+    default_base_model = "yolov9s.pt" if target == "nvidia" else "yolov8n.pt"
+    base_model = str(p_data.get("base_model") or default_base_model)
     clean_images = bool(p_data.get("clean_images", False))
 
-    coco_cfg = cfg.get("coco", {}) or {}
-    coco_dataset = str(p_data.get("coco_dataset") or coco_cfg.get("dataset") or "coco128")
+    optimizer = str(p_data.get("optimizer") or "AdamW")
+    try:
+        lr0 = float(p_data.get("lr0", 0.0005))
+    except (TypeError, ValueError):
+        lr0 = 0.0005
+
+    try:
+        lrf = float(p_data.get("lrf", 0.01))
+    except (TypeError, ValueError):
+        lrf = 0.01
+
+    cos_lr_raw = p_data.get("cos_lr", True)
+    if isinstance(cos_lr_raw, str):
+        cos_lr = cos_lr_raw.strip().lower() not in ("false", "0", "no")
+    else:
+        cos_lr = bool(cos_lr_raw)
+
+    try:
+        warmup_epochs = float(p_data.get("warmup_epochs", 5.0))
+    except (TypeError, ValueError):
+        warmup_epochs = 5.0
+
+    try:
+        warmup_momentum = float(p_data.get("warmup_momentum", 0.5))
+    except (TypeError, ValueError):
+        warmup_momentum = 0.5
+
+    try:
+        warmup_bias_lr = float(p_data.get("warmup_bias_lr", 0.0))
+    except (TypeError, ValueError):
+        warmup_bias_lr = 0.0
 
     dep_cfg = cfg.get("deployment", {}) or {}
-    deploy_host = str(p_data.get("deploy_host") or dep_cfg.get("host") or "")
-    deploy_dir = str(p_data.get("deploy_dir") or dep_cfg.get("dir") or "")
+    if target == "nvidia":
+        deploy_host = str(p_data.get("deploy_host") or "")
+        deploy_dir = str(p_data.get("deploy_dir") or "")
+    else:
+        deploy_host = str(p_data.get("deploy_host") or dep_cfg.get("host") or "")
+        deploy_dir = str(p_data.get("deploy_dir") or dep_cfg.get("dir") or "")
 
     return {
         "name": target_name,
+        "target": target,
         "remote": is_remote,
         "host": host,
         "remote_dir": remote_dir,
@@ -520,7 +553,13 @@ def get_profile(
         "patience": patience,
         "base_model": base_model,
         "clean_images": clean_images,
-        "coco_dataset": coco_dataset,
+        "optimizer": optimizer,
+        "lr0": lr0,
+        "lrf": lrf,
+        "cos_lr": cos_lr,
+        "warmup_epochs": warmup_epochs,
+        "warmup_momentum": warmup_momentum,
+        "warmup_bias_lr": warmup_bias_lr,
         "deploy_host": deploy_host,
         "deploy_dir": deploy_dir,
     }
@@ -534,6 +573,7 @@ def dump_profile_env(
     p = get_profile(profile_name, config_path=config_path)
     lines = [
         f"PROFILE_NAME='{p['name']}'",
+        f"PROFILE_TARGET='{p['target']}'",
         f"PROFILE_REMOTE='{'true' if p['remote'] else 'false'}'",
         f"PROFILE_HOST='{p['host']}'",
         f"PROFILE_REMOTE_DIR='{p['remote_dir']}'",
@@ -545,7 +585,13 @@ def dump_profile_env(
         f"PROFILE_PATIENCE='{p['patience']}'",
         f"PROFILE_BASE_MODEL='{p['base_model']}'",
         f"PROFILE_CLEAN_IMAGES='{'true' if p['clean_images'] else 'false'}'",
-        f"PROFILE_COCO_DATASET='{p['coco_dataset']}'",
+        f"PROFILE_OPTIMIZER='{p['optimizer']}'",
+        f"PROFILE_LR0='{p['lr0']}'",
+        f"PROFILE_LRF='{p['lrf']}'",
+        f"PROFILE_COS_LR='{'True' if p['cos_lr'] else 'False'}'",
+        f"PROFILE_WARMUP_EPOCHS='{p['warmup_epochs']}'",
+        f"PROFILE_WARMUP_MOMENTUM='{p['warmup_momentum']}'",
+        f"PROFILE_WARMUP_BIAS_LR='{p['warmup_bias_lr']}'",
         f"PROFILE_DEPLOY_HOST='{p['deploy_host']}'",
         f"PROFILE_DEPLOY_DIR='{p['deploy_dir']}'",
     ]
@@ -560,7 +606,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.profile_env is not None:
+        import sys
         prof_arg = args.profile_env if args.profile_env else None
-        print(dump_profile_env(prof_arg, args.config))
+        try:
+            print(dump_profile_env(prof_arg, args.config))
+        except ValueError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            sys.exit(1)
 
 
