@@ -253,25 +253,48 @@ def step3_prepare_calibration(
     val_dirs = val_rel if isinstance(val_rel, list) else [val_rel]
     train_dirs = train_rel if isinstance(train_rel, list) else [train_rel]
 
+    # Exclusively calibrate on surveillance camera frames (datasets/yolo/images/val, datasets/frigate-plus/images/val).
+    # Filter out general COCO photos to align quantization scaling with surveillance sensor noise and dynamic range.
+    def is_surveillance_path(p: Path) -> bool:
+        low = str(p).lower()
+        return "coco" not in low and "val2017" not in low and "train2017" not in low
+
     search_dirs = []
+    # 1. Primary: surveillance validation directories
     for vd in val_dirs:
         p_vd = Path(vd)
-        search_dirs.append(p_vd if p_vd.is_absolute() else dataset_root / p_vd)
-        search_dirs.append(p_vd)
-    for td in train_dirs:
-        p_td = Path(td)
-        search_dirs.append(p_td if p_td.is_absolute() else dataset_root / p_td)
-        search_dirs.append(p_td)
+        res = p_vd if p_vd.is_absolute() else dataset_root / p_vd
+        if is_surveillance_path(res) and res.exists() and res.is_dir():
+            search_dirs.append(res)
+
+    # 2. Fallback: surveillance train directories only if no surveillance validation images exist
+    if not search_dirs:
+        for td in train_dirs:
+            p_td = Path(td)
+            res = p_td if p_td.is_absolute() else dataset_root / p_td
+            if is_surveillance_path(res) and res.exists() and res.is_dir():
+                search_dirs.append(res)
+
+    # 3. Last-resort fallback to any available directories if no surveillance directories exist
+    if not search_dirs:
+        for vd in val_dirs:
+            p_vd = Path(vd)
+            res = p_vd if p_vd.is_absolute() else dataset_root / p_vd
+            if res.exists() and res.is_dir():
+                search_dirs.append(res)
 
     paths = []
     for d in search_dirs:
-        if d.exists() and d.is_dir():
-            for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
-                paths.extend(d.glob(ext))
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+            paths.extend(d.glob(ext))
 
-    # De-duplicate
+    # De-duplicate and ensure no COCO images are included if surveillance frames exist
     unique_paths = list({p.resolve(): p for p in paths}.values())
-    print(f"    Found {len(unique_paths)} candidate images across dataset.")
+    surv_paths = [p for p in unique_paths if is_surveillance_path(p)]
+    if surv_paths:
+        unique_paths = surv_paths
+
+    print(f"    Found {len(unique_paths)} candidate surveillance images for calibration.")
     if not unique_paths:
         raise RuntimeError("No calibration images found in dataset directories!")
 
@@ -389,6 +412,17 @@ def step4_generate_labels_json(
         json.dump(label_dict, f, indent=2)
     print(f"--> Updated '{labels_out}' with {len(names)} classes and quantization config: {names}")
 
+    # Generate plain text labelmap required by Frigate NVR
+    txt_out = Path(labels_out).with_suffix(".txt")
+    with open(txt_out, "w", encoding="utf-8") as f:
+        for k in sorted(names.keys(), key=int):
+            f.write(f"{k} {names[k]}\n")
+    if Path(labels_out).parent.name == "labels":
+        default_txt = Path(labels_out).parent / "labels.txt"
+        with open(default_txt, "w", encoding="utf-8") as f:
+            for k in sorted(names.keys(), key=int):
+                f.write(f"{k} {names[k]}\n")
+
 
 def find_latest_checkpoint(runs_dir: str = "runs/detect") -> str:
     path = Path(runs_dir)
@@ -408,6 +442,7 @@ def main():
     default_calib = "output/calibration_video_300_nhwc_float32.npy" if Path("output").exists() else "calibration_video_300_nhwc_float32.npy"
     parser.add_argument("--input-onnx", default=default_raw_onnx, help="Raw ONNX export input/target")
     parser.add_argument("--output-onnx", default=default_norm_onnx, help="Normalized ONNX output")
+    parser.add_argument("--output-calib", default=default_calib, help=f"Path to output calibration .npy file (default: {default_calib})")
     default_data_yaml = "datasets/data.yaml" if Path("datasets/data.yaml").exists() else ("datasets/yolo/data.yaml" if Path("datasets/yolo/data.yaml").exists() else "yolo_dataset/data.yaml")
     parser.add_argument("--data-yaml", default=default_data_yaml, help="Path to data.yaml")
     parser.add_argument("--output-labels", default=None, help="Path to labels JSON output (default: models/labels/labels_<base_model_name>.json)")

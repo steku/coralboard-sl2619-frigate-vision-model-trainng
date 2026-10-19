@@ -445,6 +445,26 @@ python frigate-to-cvat.py --accuracy-report ./reports/accuracy_eval.json --limit
 
 ---
 
+### Step 1b: Alternative Local Image Folder Upload (`folder-to-cvat.py`)
+
+If you have local image directories (e.g. raw camera snapshots or external collections) that you want to annotate in CVAT, [`folder-to-cvat.py`](folder-to-cvat.py) accepts all images in the folder (no filtering applied) with labels defined in a YAML file:
+
+```bash
+# Upload all images in a folder using labels from config.yaml:
+python folder-to-cvat.py /path/to/images/
+
+# Upload images with custom labels YAML:
+python folder-to-cvat.py /path/to/images/ --labels-file labels.yaml
+
+# Upload images with custom task name:
+python folder-to-cvat.py /path/to/images/ -l labels.yaml -t "Driveway Captures"
+
+# Dry-run validation (preview images and parsed labels without uploading):
+python folder-to-cvat.py /path/to/images/ --dry-run
+```
+
+---
+
 ### Step 2: Audit Dataset Balance & Review in CVAT
 
 #### 1. Audit Balance (`report-cvat-balance.py`)
@@ -589,7 +609,68 @@ The Torq NPU binary outputs raw integer indices ($0 \dots C-1$). If `labels_<nam
 
 ---
 
-### Step 5: Test & Benchmark Vision Server (`test_server_accuracy.py`)
+### Step 5: Deployment to Frigate NVR (NVIDIA GPU / TensorRT)
+
+When using the `nvidia` or `spark-nvidia` training profiles, the pipeline exports a full-precision ONNX model (e.g. `models/compiled/custom_yolov9s.onnx` or `custom_yolov8n.onnx`) directly optimized for NVIDIA GPUs running TensorRT inside Frigate.
+
+#### 1. Frigate `config.yml` Detector & Model Configuration
+
+```yaml
+detectors:
+  tensorrt:
+    type: tensorrt
+    device: 0                         # NVIDIA GPU index (0 for first GPU)
+
+model:
+  path: /config/models/custom_yolov9s.onnx  # Path to the .onnx model mounted in Frigate
+  width: 320                         # Matches training imgsz (320)
+  height: 320                        # Matches training imgsz (320)
+  input_tensor: nchw                 # Ultralytics ONNX layout: [1, 3, 320, 320]
+  input_pixel_format: rgb            # Standard float32 RGB inputs normalized to [0.0, 1.0]
+  model_type: yolov8                 # Parses Ultralytics detection head (see note below)
+  labelmap_path: /config/models/labels.txt  # Plain-text label mapping (e.g. labels_yolov9s.txt or labels.txt)
+
+objects:
+  track:
+    - person
+    - car
+    - dog
+    - cat
+    - horse
+    - bird
+    - truck
+```
+
+#### 2. Option Reference
+
+| Option | Value | Description |
+| :--- | :--- | :--- |
+| `type` | `tensorrt` | Enables Frigate's TensorRT runtime. On first startup, Frigate ingests the `.onnx` model and compiles an optimized local TensorRT `.engine` cache. |
+| `input_tensor` | `nchw` | Ultralytics exports models in channel-first format `(batch, channels, height, width)`. |
+| `input_pixel_format` | `rgb` | Normalizes input camera frames to standard RGB float32 in $[0.0, 1.0]$. |
+| `model_type` | `yolov8` | Selects Frigate's built-in decoder for Ultralytics raw detection outputs `[1, 84, 2100]` (4 box coordinates + 80 class scores). |
+| `width` / `height` | `320` | Input spatial dimensions; must match `--imgsz` (320 in standard profiles). |
+| `labelmap_path` | `/config/models/labels.txt` | Path to the plain-text labels file generated during training (`labels_<name>.txt` or `labels.txt`). **Note:** Frigate requires plain text (`.txt` with `ID label` or one label per line), **not** `.json`. Can be omitted if tracking canonical COCO classes. |
+
+> [!NOTE]
+> **Is the configuration identical for YOLOv9 and YOLOv8?**
+> **Yes.** Ultralytics exports both YOLOv8 and YOLOv9 with the exact same decoupled detection head architecture: input layout `[1, 3, 320, 320]` (NCHW, RGB) and output tensor `[1, 84, 2100]`. In Frigate NVR, `model_type: yolov8` (or `yolo-generic`) is the designated parser for both YOLOv8 and YOLOv9 ONNX models.
+
+#### 3. Docker Volume Mount
+
+Mount the directory holding the compiled ONNX model and `labels.txt` into the Frigate container:
+
+```bash
+docker run -d \
+  --name frigate \
+  --gpus all \
+  -v /home/steve/Projects/frigate-model-training/models/compiled:/config/models:ro \
+  ...
+```
+
+---
+
+### Step 6: Test & Benchmark Vision Server (`test_server_accuracy.py`)
 
 #### 1. Quick Server Health Check
 
@@ -713,6 +794,32 @@ objects:
 
 ---
 
+### Step 7: Benchmark NVIDIA GPU / ONNX Model Accuracy (`test_nvidia_accuracy.py`)
+
+[`test_nvidia_accuracy.py`](test_nvidia_accuracy.py) benchmarks local or remote NVIDIA models (`.onnx` or `.pt`) directly on CUDA GPU or CPU, reporting per-class Precision, Recall, F1-Score, mIoU, and execution latency. It mirrors the exact command-line interface and dataset options of `test_server_accuracy.py`.
+
+```bash
+# 1. Benchmark default compiled NVIDIA model (custom_yolov9s.onnx) on 60 random dataset images:
+python test_nvidia_accuracy.py
+
+# 2. Benchmark on CUDA GPU with specific confidence threshold:
+python test_nvidia_accuracy.py --device cuda --threshold 0.15
+
+# 3. Benchmark a specific PyTorch checkpoint (.pt):
+python test_nvidia_accuracy.py --model runs/detect/frigate_coral/yolov9s/weights/best.pt --device cuda
+
+# 4. Evaluate all images in the validation split:
+python test_nvidia_accuracy.py --split val --all
+
+# 5. Evaluate retention on 500 COCO validation images (anti-forgetting check):
+python test_nvidia_accuracy.py --num-images 0 --coco-images 500 --output-json nvidia_coco_retention.json
+
+# 6. Combined evaluation across local YOLO, Frigate+, and COCO datasets:
+python test_nvidia_accuracy.py --num-images 40 --frigate-plus-images 40 --coco-images 40 --verbose
+```
+
+---
+
 ## Technical Pipeline Details (`train.sh`)
 
 When `train.sh` executes compilation, it carries out the following steps:
@@ -723,7 +830,7 @@ When `train.sh` executes compilation, it carries out the following steps:
 4. **Full INT8 Quantization (`onnx2tf`)**: Runs `onnx2tf` with `--tflite_backend tf_converter` and calibration data, producing full integer quantized TFLite (`[1, 320, 320, 3] int8` input, `[1, 4+N, 2100] int8` output).
 5. **TOSA MLIR Lowering (`tosa-converter-for-tflite`)**: Lowers the quantized TFLite graph to TOSA MLIR dialect.
 6. **Hardware Vector Compilation (`torq-compile`)**: Compiles TOSA MLIR with `--torq-hw=SL2610` into a hardware binary (`.vmfb`) executing natively inside Astra SL2610 NSS vector slices without LRAM overflow.
-7. **Quantization Scale Extraction**: Extracts output quantization scales and zero-points from the TFLite model and generates [`models/labels/labels_<name>.json`](models/labels).
+7. **Quantization Scale Extraction**: Extracts output quantization scales and zero-points from the TFLite model and generates [`models/labels/labels_<name>.json`](models/labels) and Frigate labelmaps [`models/labels/labels_<name>.txt`](models/labels).
 
 ---
 
@@ -752,11 +859,13 @@ python export-cvat-to-yolo.py --export all --replace
 | Script / Component | Description |
 | :--- | :--- |
 | [`frigate-to-cvat.py`](frigate-to-cvat.py) | **Frigate Harvest & CVAT Upload**: Downloads events from Frigate, creates COCO pre-annotations, and uploads review tasks to CVAT with dynamic deficit balancing. |
+| [`folder-to-cvat.py`](folder-to-cvat.py) | **Folder Image Uploader**: Ingests all images in a local directory with labels from a YAML file and creates a task in CVAT without filtering. |
 | [`report-cvat-balance.py`](report-cvat-balance.py) | **CVAT Dataset Balance Auditor**: Inspects annotation distributions across CVAT tasks/jobs, calculating class deficits, health status, and visual bars. |
 | [`train.sh`](train.sh) | **Unified Pipeline Runner**: Automates CVAT export, local GPU or remote Spark training (`-p spark`, `-p spark-yolo26n`), ONNX export, INT8 quantization, TOSA lowering, Torq compilation, and deployment. |
 | [`config_utils.py`](config_utils.py) | **Configuration Engine**: Parses `config.yaml`, resolves execution profiles, normalizes balance modes, maps COCO-80 classes, and dumps shell variables for `train.sh`. |
 | [`export-cvat-to-yolo.py`](export-cvat-to-yolo.py) | **CVAT Exporter**: Connects to CVAT REST API and exports annotations to `datasets/yolo/` with train/val splits and `data.yaml`. |
 | [`deploy_to_coralboard.sh`](deploy_to_coralboard.sh) | **Model Deployer**: Deploys compiled `.vmfb` and `labels.json` to Coralboard locally or via SCP, with optional SSH service restart and HTTP health checks. |
 | [`test_server_accuracy.py`](test_server_accuracy.py) | **Server Accuracy Benchmark**: Evaluates running vision proxy against dataset images and COCO reference images, measuring precision, recall, F1, and NPU latency. |
-| [`prepare_for_onnx2tf.py`](prepare_for_onnx2tf.py) | **ONNX Normalizer**: Divides ONNX box coordinates by 320.0, generates class-balanced INT8 calibration `.npy`, and writes `labels.json`. |
+| [`test_nvidia_accuracy.py`](test_nvidia_accuracy.py) | **NVIDIA Model Benchmark**: Evaluates exported ONNX or PyTorch models on CUDA GPU/CPU against dataset, Frigate+, and COCO reference images with latency and mIoU. |
+| [`prepare_for_onnx2tf.py`](prepare_for_onnx2tf.py) | **ONNX Normalizer**: Divides ONNX box coordinates by 320.0, generates class-balanced INT8 calibration `.npy`, and writes `labels.json` and Frigate `labels.txt`. |
 | [`tests/`](tests/) | **Automated Test Suite**: Pytest unit tests validating configuration resolution, balancing algorithms, accuracy calculations, and dataset conversions. |

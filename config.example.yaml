@@ -108,12 +108,13 @@ modes:
 # Model Deployment Settings (train.sh & deploy_to_coralboard.sh)
 # ------------------------------------------------------------------------------
 deployment:
-  # Remote target host for SCP deployment of .vmfb and labels_<name>.json:
+  # Remote target host for SCP deployment of .vmfb/.onnx and labels (JSON and Frigate .txt):
   # e.g., "root@coralboard.local:/path/to/coralboard-sl2619-vision/models"
+  # or Frigate host: "user@frigate-server:/path/to/frigate/models"
   host: null
 
-  # Or local target directory to copy .vmfb and labels_<name>.json into:
-  # e.g., "../coralboard-sl2619-vision/models"
+  # Or local target directory to copy .vmfb/.onnx and labels into:
+  # e.g., "../coralboard-sl2619-vision/models" or "./models/compiled"
   dir: null
 
   # Automatically restart the vision service on Coralboard via SSH upon deployment:
@@ -182,8 +183,8 @@ profiles:
     batch: 32
     workers: 8
     cache: "ram"
-    epochs: 80
-    patience: 50
+    epochs: 100
+    patience: 30
     base_model: "yolov8n.pt"
     optimizer: "AdamW"
     lr0: 0.0005
@@ -204,8 +205,8 @@ profiles:
     batch: 32
     workers: 8
     cache: "ram"
-    epochs: 80
-    patience: 50
+    epochs: 120
+    patience: 35
     base_model: "yolo26n.pt"
     optimizer: "AdamW"
     lr0: 0.0005
@@ -217,15 +218,17 @@ profiles:
     clean_images: false
 
   # NVIDIA Video Card ONNX output profile (Default model: yolov9s.pt)
+  # Deploys to Frigate using: type: tensorrt (or onnx), input_tensor: nchw, model_type: yolov8 or yolo-generic
+  # Note: Frigate requires plain-text labelmap_path (e.g. labels_yolov9s.txt or labels.txt), NOT .json
   nvidia:
     target: "nvidia"
     remote: false
     device: "0"
-    batch: 8
+    batch: 16
     workers: 8
     cache: "ram"
     epochs: 80
-    patience: 50
+    patience: 20
     base_model: "yolov9s.pt"
     optimizer: "AdamW"
     lr0: 0.0005
@@ -245,8 +248,8 @@ profiles:
     batch: 32
     workers: 8
     cache: "ram"
-    epochs: 80
-    patience: 50
+    epochs: 100
+    patience: 30
     base_model: "yolov9s.pt"
     optimizer: "AdamW"
     lr0: 0.0005

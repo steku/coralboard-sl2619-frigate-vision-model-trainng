@@ -1010,6 +1010,8 @@ fi
 if [[ "${SKIP_DEPLOY}" == "false" ]]; then
     ARTIFACT_BASENAME="$(basename "${PRIMARY_ARTIFACT}")"
     LABELS_BASENAME="$(basename "${LABELS_FILE}")"
+    LABELS_TXT_FILE="${LABELS_FILE%.json}.txt"
+    LABELS_TXT_BASENAME="$(basename "${LABELS_TXT_FILE}")"
 
     if [[ -n "${DEPLOY_DIR}" ]]; then
         echo ""
@@ -1018,7 +1020,11 @@ if [[ "${SKIP_DEPLOY}" == "false" ]]; then
         cp -f "${PRIMARY_ARTIFACT}" "${DEPLOY_DIR}/${ARTIFACT_BASENAME}"
         cp -f "${LABELS_FILE}" "${DEPLOY_DIR}/${LABELS_BASENAME}"
         cp -f "${LABELS_FILE}" "${DEPLOY_DIR}/labels.json"
-        log_success "Deployed ${ARTIFACT_BASENAME} and ${LABELS_BASENAME} to ${DEPLOY_DIR}/"
+        if [[ -f "${LABELS_TXT_FILE}" ]]; then
+            cp -f "${LABELS_TXT_FILE}" "${DEPLOY_DIR}/${LABELS_TXT_BASENAME}"
+            cp -f "${LABELS_TXT_FILE}" "${DEPLOY_DIR}/labels.txt"
+        fi
+        log_success "Deployed ${ARTIFACT_BASENAME}, ${LABELS_BASENAME}, and ${LABELS_TXT_BASENAME} to ${DEPLOY_DIR}/"
     fi
 
     if [[ -n "${DEPLOY_HOST}" ]]; then
@@ -1028,7 +1034,11 @@ if [[ "${SKIP_DEPLOY}" == "false" ]]; then
         scp "${PRIMARY_ARTIFACT}" "${CLEAN_HOST}/${ARTIFACT_BASENAME}"
         scp "${LABELS_FILE}" "${CLEAN_HOST}/${LABELS_BASENAME}"
         scp "${LABELS_FILE}" "${CLEAN_HOST}/labels.json"
-        log_success "Deployed ${ARTIFACT_BASENAME} and ${LABELS_BASENAME} (and labels.json) via SCP to ${CLEAN_HOST}!"
+        if [[ -f "${LABELS_TXT_FILE}" ]]; then
+            scp "${LABELS_TXT_FILE}" "${CLEAN_HOST}/${LABELS_TXT_BASENAME}"
+            scp "${LABELS_TXT_FILE}" "${CLEAN_HOST}/labels.txt"
+        fi
+        log_success "Deployed ${ARTIFACT_BASENAME}, ${LABELS_BASENAME}, and ${LABELS_TXT_BASENAME} via SCP to ${CLEAN_HOST}!"
     fi
 fi
 
@@ -1049,5 +1059,10 @@ else
     echo "  1. Hardware Binary : ${OUTPUT_VMFB} ($(du -h "${OUTPUT_VMFB}" | cut -f1))"
 fi
 echo "  2. Label Metadata  : ${LABELS_FILE}"
-echo "  3. PyTorch Weights : ${WEIGHTS_PATH}"
+if [[ -f "${LABELS_FILE%.json}.txt" ]]; then
+    echo "  3. Frigate Labelmap: ${LABELS_FILE%.json}.txt"
+    echo "  4. PyTorch Weights : ${WEIGHTS_PATH}"
+else
+    echo "  3. PyTorch Weights : ${WEIGHTS_PATH}"
+fi
 echo "=========================================================================="

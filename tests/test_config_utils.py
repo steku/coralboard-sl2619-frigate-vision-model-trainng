@@ -74,7 +74,7 @@ def test_get_profile_resolution():
     assert p_spark["target"] == "torq"
     assert p_spark["remote"] is True
     assert p_spark["batch"] == 32
-    assert p_spark["patience"] == 50
+    assert p_spark["patience"] == 30
     assert p_spark["optimizer"] == "AdamW"
     assert p_spark["lr0"] == 0.0005
     assert p_spark["warmup_epochs"] == 5.0
@@ -85,8 +85,8 @@ def test_get_profile_resolution():
     assert p_26n_hyphen["base_model"] == "yolo26n.pt"
     assert p_26n_under["base_model"] == "yolo26n.pt"
     assert p_26n_hyphen["remote"] is True
-    assert p_26n_hyphen["patience"] == 75
-    assert p_26n_under["patience"] == 75
+    assert p_26n_hyphen["patience"] == 35
+    assert p_26n_under["patience"] == 35
     assert p_26n_hyphen["optimizer"] == "AdamW"
     assert p_26n_hyphen["lr0"] == 0.0005
     assert p_26n_hyphen["target"] == "torq"
@@ -103,6 +103,9 @@ def test_get_profile_resolution():
     assert p_nvidia["target"] == "nvidia"
     assert p_nvidia["base_model"] == "yolov9s.pt"
     assert p_nvidia["deploy_host"] == ""
+    assert p_nvidia["batch"] == 16
+    assert p_nvidia["epochs"] == 80
+    assert p_nvidia["patience"] == 20
     assert p_nvidia["optimizer"] == "AdamW"
     assert p_nvidia["lr0"] == 0.0005
 
@@ -112,6 +115,9 @@ def test_get_profile_resolution():
     assert p_spark_nvidia["target"] == "nvidia"
     assert p_spark_nvidia["base_model"] == "yolov9s.pt"
     assert p_spark_nvidia["deploy_host"] == ""
+    assert p_spark_nvidia["batch"] == 32
+    assert p_spark_nvidia["epochs"] == 100
+    assert p_spark_nvidia["patience"] == 30
 
     # Unknown profile (including 'nvidia-spark') raises ValueError
     with pytest.raises(ValueError, match="Unknown profile"):
@@ -227,11 +233,13 @@ def test_prepare_training_data_yaml(tmp_path, monkeypatch):
     assert "train" in data
     assert "val" in data
     assert len(data["train"]) == 3
-    assert len(data["val"]) == 3
+    assert len(data["val"]) == 2
     assert str(yolo_dir / "images" / "train") in data["train"]
     assert str(fp_dir / "images" / "train") in data["train"]
+    assert str(coco_train) in data["train"]
     assert str(yolo_dir / "images" / "val") in data["val"]
     assert str(fp_dir / "images" / "val") in data["val"]
+    assert str(coco_train) not in data["val"]
     assert "names" in data
     assert data["names"][0] == "person"
 

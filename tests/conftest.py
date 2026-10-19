@@ -35,6 +35,13 @@ def export_cvat_module():
     return load_module_from_path("export_cvat_to_yolo", path)
 
 
+@pytest.fixture(scope="session")
+def folder_cvat_module():
+    """Import and return the folder-to-cvat module."""
+    path = REPO_ROOT / "folder-to-cvat.py"
+    return load_module_from_path("folder_to_cvat", path)
+
+
 @pytest.fixture
 def sample_accuracy_report():
     """Return a mock dictionary mirroring test_server_accuracy.py benchmark output."""

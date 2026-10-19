@@ -404,7 +404,7 @@ def download_coco_dataset(dataset_name: str, target_dir: str = "datasets") -> Di
 
 
 def prepare_training_data_yaml(
-    coco_dataset: Optional[str] = "coco128",
+    coco_dataset: Optional[str] = None,
     workspace_dir: str = ".",
     include_frigate_plus: Optional[bool] = None,
     frigate_plus_dir: Optional[str] = None,
@@ -421,6 +421,8 @@ def prepare_training_data_yaml(
     legacy_out_yaml = yolo_dir / "data.yaml"
 
     cfg = load_config()
+    if coco_dataset is None:
+        coco_dataset = cfg.get("coco", {}).get("dataset", "coco-val2017")
     fp_cfg = get_frigate_plus_config(cfg)
     if include_frigate_plus is None:
         include_frigate_plus = fp_cfg["enabled"]
@@ -473,7 +475,13 @@ def prepare_training_data_yaml(
         print(f"[DATASET] COCO Train Directory: {coco_info['train_dir']}")
         print(f"[DATASET] COCO Val Directory  : {coco_info['val_dir']}")
         train_paths.append(str(Path(coco_info["train_dir"]).resolve()))
-        val_paths.append(str(Path(coco_info["val_dir"]).resolve()))
+        # Purify validation split: keep COCO in train for anti-forgetting regularization,
+        # but exclude COCO from val when surveillance sets (local yolo or frigate-plus) exist
+        # to ensure best.pt is selected purely by surveillance camera mAP.
+        if not val_paths:
+            val_paths.append(str(Path(coco_info["val_dir"]).resolve()))
+        else:
+            print("[DATASET] Excluding COCO from val split to purify best.pt surveillance selection.")
 
     data_dict = {
         "train": train_paths,
