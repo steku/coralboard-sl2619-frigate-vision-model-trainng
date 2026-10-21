@@ -124,15 +124,21 @@ def load_dataset_classes(data_yaml_path: str = "datasets/data.yaml") -> Dict[int
         # Check fallback to models/labels/*.json
         labels_dir = Path("models/labels")
         if labels_dir.is_dir():
-            for f in labels_dir.glob("labels_*.json"):
-                try:
-                    import json
-                    with open(f, "r", encoding="utf-8") as jf:
-                        d = json.load(jf)
-                        if "names" in d:
-                            return {int(k): str(v) for k, v in d["names"].items()}
-                except Exception:
-                    pass
+            candidates = [
+                labels_dir / "torq_yolov8n.json",
+                labels_dir / "nvidia_yolov9s.json",
+                labels_dir / "labels.json",
+            ] + sorted(labels_dir.glob("*.json"))
+            for f in candidates:
+                if f.is_file():
+                    try:
+                        import json
+                        with open(f, "r", encoding="utf-8") as jf:
+                            d = json.load(jf)
+                            if "names" in d:
+                                return {int(k): str(v) for k, v in d["names"].items()}
+                    except Exception:
+                        pass
         raise FileNotFoundError(f"Dataset config not found at {data_yaml_path}")
 
     with open(p, "r", encoding="utf-8") as f:
@@ -432,7 +438,7 @@ def prepare_training_data_yaml(
     fp_path = (workspace / frigate_plus_dir).resolve() if not Path(frigate_plus_dir).is_absolute() else Path(frigate_plus_dir)
 
     names = get_coco_80_dict()
-    for cand in (out_yaml, legacy_out_yaml):
+    for cand in (out_yaml, legacy_out_yaml, fp_path / "data.yaml", fp_path / "dataset.yaml"):
         if cand.is_file():
             try:
                 with open(cand, "r", encoding="utf-8") as f:
@@ -442,7 +448,6 @@ def prepare_training_data_yaml(
                     for k, v in existing_names.items():
                         if int(k) >= 80:
                             names[int(k)] = str(v)
-                break
             except Exception:
                 pass
 

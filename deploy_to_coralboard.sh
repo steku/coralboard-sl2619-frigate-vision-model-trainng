@@ -77,8 +77,8 @@ usage() {
     echo "  --dir PATH              Local directory destination (e.g. ../coralboard-sl2619-vision/models)"
     echo ""
     echo "Artifact Options:"
-    echo "  --model PATH            Path to compiled .vmfb model (default: auto-detected models/compiled/custom_*.vmfb)"
-    echo "  --labels PATH           Path to labels_<name>.json mapping (default: auto-detected models/labels/labels_<name>.json)"
+    echo "  --model PATH            Path to compiled .vmfb model (default: auto-detected models/compiled/torq_*.vmfb)"
+    echo "  --labels PATH           Path to labels JSON mapping (default: auto-detected models/labels/torq_<name>.json)"
     echo ""
     echo "Service Management:"
     echo "  --restart               Restart the remote vision service via SSH after deployment"
@@ -142,8 +142,8 @@ echo "==========================================================================
 # Validate Model & Labels Artifacts
 # ------------------------------------------------------------------------------
 if [[ -z "${MODEL_PATH}" ]]; then
-    # Auto-detect latest compiled custom_*.vmfb by modification timestamp in models/compiled/ or root
-    MODEL_PATH=$(find models/compiled models . -maxdepth 2 -name "custom_*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+    # Auto-detect latest compiled *.vmfb by modification timestamp in models/compiled/ or root
+    MODEL_PATH=$(find models/compiled models . -maxdepth 2 -name "torq_*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
     MODEL_PATH="${MODEL_PATH#./}"
     if [[ -z "${MODEL_PATH}" ]]; then
         MODEL_PATH=$(find models/compiled models . -maxdepth 2 -name "*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
@@ -158,13 +158,16 @@ fi
 
 if [[ -z "${LABELS_PATH}" ]]; then
     MODEL_STEM="$(basename "${MODEL_PATH%.*}")"
-    CANDIDATE_NAME="${MODEL_STEM#custom_}"
-    if [[ -f "models/labels/labels_${CANDIDATE_NAME}.json" ]]; then
-        LABELS_PATH="models/labels/labels_${CANDIDATE_NAME}.json"
-    elif [[ -f "models/labels/labels_${MODEL_STEM}.json" ]]; then
-        LABELS_PATH="models/labels/labels_${MODEL_STEM}.json"
+    CANDIDATE_NAME="${MODEL_STEM#torq_}"
+    CANDIDATE_BASE="${CANDIDATE_NAME%_[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]}"
+    if [[ -f "models/labels/torq_${CANDIDATE_BASE}.json" ]]; then
+        LABELS_PATH="models/labels/torq_${CANDIDATE_BASE}.json"
+    elif [[ -f "models/labels/torq_${CANDIDATE_NAME}.json" ]]; then
+        LABELS_PATH="models/labels/torq_${CANDIDATE_NAME}.json"
+    elif [[ -f "models/labels/labels.json" ]]; then
+        LABELS_PATH="models/labels/labels.json"
     else
-        LATEST_LABELS=$(find models/labels -maxdepth 1 -name "labels_*.json" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+        LATEST_LABELS=$(find models/labels -maxdepth 1 -name "*.json" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
         if [[ -n "${LATEST_LABELS}" ]]; then
             LABELS_PATH="${LATEST_LABELS}"
         fi

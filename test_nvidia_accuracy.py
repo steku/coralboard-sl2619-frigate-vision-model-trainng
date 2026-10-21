@@ -34,7 +34,7 @@ import config_utils
 def find_default_model() -> str:
     """Auto-detect the most appropriate default NVIDIA model (.onnx or .pt)."""
     candidates = [
-        Path("models/compiled/custom_yolov9s.onnx"),
+        Path("models/compiled/nvidia_yolov9s.onnx"),
         Path("output/best_normalized_output.onnx"),
         Path("output/best.onnx"),
     ]
@@ -44,6 +44,9 @@ def find_default_model() -> str:
 
     compiled_dir = Path("models/compiled")
     if compiled_dir.is_dir():
+        onnx_files = sorted(compiled_dir.glob("nvidia_*.onnx"), key=lambda p: p.stat().st_mtime)
+        if onnx_files:
+            return str(onnx_files[-1])
         onnx_files = sorted(compiled_dir.glob("*.onnx"), key=lambda p: p.stat().st_mtime)
         if onnx_files:
             return str(onnx_files[-1])
@@ -59,15 +62,14 @@ def find_default_model() -> str:
     if Path("yolov9s.pt").is_file():
         return "yolov9s.pt"
 
-    return "models/compiled/custom_yolov9s.onnx"
+    return "models/compiled/nvidia_yolov9s.onnx"
 
 
 def parse_args():
     default_model = find_default_model()
-    default_ds = "./datasets/yolo" if Path("datasets/yolo").is_dir() else "./yolo_dataset"
+    default_ds = "./datasets/yolo"
     default_coco_ds = config_utils.load_config().get("coco", {}).get("dataset", "coco-val2017")
     default_fp_dir = config_utils.load_config().get("frigate_plus", {}).get("path", "./datasets/frigate-plus")
-    default_device = "cuda"
 
     parser = argparse.ArgumentParser(
         description="Benchmark detection accuracy and inference latency for NVIDIA ONNX and PyTorch models.",
@@ -75,9 +77,6 @@ def parse_args():
     )
     parser.add_argument(
         "--model",
-        "--model-path",
-        "--onnx",
-        "--weights",
         dest="model",
         default=default_model,
         help=f"Path to ONNX model (.onnx) or PyTorch checkpoint (.pt) (default: {default_model})",
@@ -123,7 +122,6 @@ def parse_args():
     )
     parser.add_argument(
         "--threshold",
-        "--conf",
         dest="threshold",
         type=float,
         default=0.20,
@@ -137,14 +135,12 @@ def parse_args():
     )
     parser.add_argument(
         "--output-json",
-        "--json",
         dest="output_json",
         default=None,
         help="Optional path to export evaluation report as JSON",
     )
     parser.add_argument(
         "--coco-images",
-        "--num-coco-images",
         dest="coco_images",
         type=int,
         default=0,
@@ -163,7 +159,6 @@ def parse_args():
     )
     parser.add_argument(
         "--frigate-plus-images",
-        "--num-frigate-plus-images",
         dest="frigate_plus_images",
         type=int,
         default=0,
@@ -176,7 +171,6 @@ def parse_args():
     )
     parser.add_argument(
         "--labels",
-        "--labels-json",
         dest="labels_path",
         default=None,
         help="Optional path to custom labels.json metadata file",
@@ -205,7 +199,7 @@ def load_class_names(dataset_dir: Path, labels_path: Optional[str] = None) -> Di
             print(f"[WARN] Could not parse labels file '{labels_path}': {e}")
 
     for candidate in [
-        Path("models/labels/labels_yolov9s.json"),
+        Path("models/labels/nvidia_yolov9s.json"),
         Path("models/labels/labels.json"),
         Path("labels.json"),
         dataset_dir / "data.yaml",

@@ -245,7 +245,7 @@ profiles:
     host: "user@dgx-spark.local"
     remote_dir: "~/frigate-model-training"
     device: "0"
-    batch: 32
+    batch: 16
     workers: 8
     cache: "ram"
     epochs: 100

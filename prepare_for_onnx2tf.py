@@ -7,6 +7,7 @@ https://developer.synaptics.com/blog/custom-yolo-to-torq
 
 import argparse
 from collections import defaultdict, Counter
+import datetime
 import json
 import os
 from pathlib import Path
@@ -363,22 +364,22 @@ def step4_generate_labels_json(
     tflite_path: str = "onnx2tf_normalized_full_int8/best_normalized_output_full_integer_quant.tflite",
     model_name: str = "YOLO",
     base_model_name: str = None,
-    base_name: str = None,
+    target: str = "torq",
 ):
     names = load_dataset_metadata(data_yaml_path)
-    resolved_base = base_model_name or base_name or model_name
+    resolved_base = base_model_name or model_name
     if labels_out is None:
+        timestamp = datetime.datetime.now().strftime("%y%m%d-%H%M")
         labels_dir = Path("models/labels")
         if labels_dir.exists():
-            labels_out = str(labels_dir / f"labels_{resolved_base}.json")
+            labels_out = str(labels_dir / f"{target}_{resolved_base}_{timestamp}.json")
         else:
-            labels_out = f"labels_{resolved_base}.json"
+            labels_out = f"{target}_{resolved_base}_{timestamp}.json"
 
     label_dict = {
         "description": f"Frigate custom trained {model_name} object detection model",
         "author": "Frigate Pipeline",
         "base_model_name": resolved_base,
-        "base_name": resolved_base,
         "stride": 32,
         "task": "detect",
         "batch": 1,
@@ -407,21 +408,55 @@ def step4_generate_labels_json(
         except Exception as e:
             print(f"    (Could not inspect TFLite quantization parameters: {e})")
 
-    Path(labels_out).parent.mkdir(parents=True, exist_ok=True)
-    with open(labels_out, "w", encoding="utf-8") as f:
+    labels_path = Path(labels_out)
+    labels_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(labels_path, "w", encoding="utf-8") as f:
         json.dump(label_dict, f, indent=2)
     print(f"--> Updated '{labels_out}' with {len(names)} classes and quantization config: {names}")
 
     # Generate plain text labelmap required by Frigate NVR
-    txt_out = Path(labels_out).with_suffix(".txt")
+    txt_out = labels_path.with_suffix(".txt")
     with open(txt_out, "w", encoding="utf-8") as f:
         for k in sorted(names.keys(), key=int):
             f.write(f"{k} {names[k]}\n")
-    if Path(labels_out).parent.name == "labels":
-        default_txt = Path(labels_out).parent / "labels.txt"
-        with open(default_txt, "w", encoding="utf-8") as f:
-            for k in sorted(names.keys(), key=int):
-                f.write(f"{k} {names[k]}\n")
+
+    # Create soft links without datetime
+    labels_dir = labels_path.parent
+    clean_json = labels_dir / f"{target}_{resolved_base}.json"
+    clean_txt = labels_dir / f"{target}_{resolved_base}.txt"
+    if clean_json != labels_path:
+        if clean_json.is_symlink() or clean_json.exists():
+            clean_json.unlink()
+        try:
+            clean_json.symlink_to(labels_path.name)
+        except OSError:
+            pass
+
+    if clean_txt != txt_out:
+        if clean_txt.is_symlink() or clean_txt.exists():
+            clean_txt.unlink()
+        try:
+            clean_txt.symlink_to(txt_out.name)
+        except OSError:
+            pass
+
+    default_json = labels_dir / "labels.json"
+    if default_json != labels_path:
+        if default_json.is_symlink() or default_json.exists():
+            default_json.unlink()
+        try:
+            default_json.symlink_to(labels_path.name)
+        except OSError:
+            pass
+
+    default_txt = labels_dir / "labels.txt"
+    if default_txt != txt_out:
+        if default_txt.is_symlink() or default_txt.exists():
+            default_txt.unlink()
+        try:
+            default_txt.symlink_to(txt_out.name)
+        except OSError:
+            pass
 
 
 def find_latest_checkpoint(runs_dir: str = "runs/detect") -> str:
@@ -443,9 +478,9 @@ def main():
     parser.add_argument("--input-onnx", default=default_raw_onnx, help="Raw ONNX export input/target")
     parser.add_argument("--output-onnx", default=default_norm_onnx, help="Normalized ONNX output")
     parser.add_argument("--output-calib", default=default_calib, help=f"Path to output calibration .npy file (default: {default_calib})")
-    default_data_yaml = "datasets/data.yaml" if Path("datasets/data.yaml").exists() else ("datasets/yolo/data.yaml" if Path("datasets/yolo/data.yaml").exists() else "yolo_dataset/data.yaml")
+    default_data_yaml = "datasets/data.yaml"
     parser.add_argument("--data-yaml", default=default_data_yaml, help="Path to data.yaml")
-    parser.add_argument("--output-labels", default=None, help="Path to labels JSON output (default: models/labels/labels_<base_model_name>.json)")
+    parser.add_argument("--output-labels", default=None, help="Path to labels JSON output (default: models/labels/<target>_<base_model_name>_<timestamp>.json)")
     parser.add_argument("--imgsz", type=int, default=320, help="Model image resolution (default: 320)")
     parser.add_argument("--max-calib", type=int, default=300, help="Max calibration images (default: 300)")
     parser.add_argument("--min-calib", type=int, default=50, help="Min calibration images when using percentage (default: 50)")
@@ -454,6 +489,7 @@ def main():
     parser.add_argument("--calib-seed", type=int, default=42, help="Random seed for calibration selection (default: 42)")
     parser.add_argument("--base-model-name", default=None, help="Base model name (default: derived from model-pt or YOLO)")
     parser.add_argument("--skip-export", action="store_true", help="Skip ONNX export (use existing input-onnx)")
+    parser.add_argument("--target", default="torq", choices=["torq", "nvidia"], help="Target format (default: torq)")
 
     args = parser.parse_args()
 
@@ -474,13 +510,14 @@ def main():
     if args.output_labels:
         output_labels = args.output_labels
     else:
+        timestamp = datetime.datetime.now().strftime("%y%m%d-%H%M")
         labels_dir = Path("models/labels")
         if labels_dir.exists():
-            output_labels = str(labels_dir / f"labels_{detected_name}.json")
+            output_labels = str(labels_dir / f"{args.target}_{detected_name}_{timestamp}.json")
         else:
-            output_labels = f"labels_{detected_name}.json"
+            output_labels = f"{args.target}_{detected_name}_{timestamp}.json"
 
-    step4_generate_labels_json(args.data_yaml, output_labels, model_name=detected_name, base_model_name=detected_name)
+    step4_generate_labels_json(args.data_yaml, output_labels, model_name=detected_name, base_model_name=detected_name, target=args.target)
     print(f"Pre-conversion preparation finished successfully! Labels written to: {output_labels}")
 
 

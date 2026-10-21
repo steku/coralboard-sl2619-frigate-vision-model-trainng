@@ -322,7 +322,7 @@ def main():
         default=["latest"],
         help="CVAT Task ID(s) to export (default: 'latest' or read from .last_cvat_task)",
     )
-    default_out = "./datasets/yolo" if Path("datasets/yolo").is_dir() or not Path("yolo_dataset").is_dir() else "./yolo_dataset"
+    default_out = "./datasets/yolo"
     parser.add_argument(
         "--output-dir",
         type=str,
@@ -337,7 +337,6 @@ def main():
     )
     parser.add_argument(
         "--replace",
-        "--overwrite",
         dest="append",
         action="store_false",
         default=True,

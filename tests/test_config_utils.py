@@ -115,7 +115,7 @@ def test_get_profile_resolution():
     assert p_spark_nvidia["target"] == "nvidia"
     assert p_spark_nvidia["base_model"] == "yolov9s.pt"
     assert p_spark_nvidia["deploy_host"] == ""
-    assert p_spark_nvidia["batch"] == 32
+    assert p_spark_nvidia["batch"] == 16
     assert p_spark_nvidia["epochs"] == 100
     assert p_spark_nvidia["patience"] == 30
 

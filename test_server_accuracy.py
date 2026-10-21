@@ -42,7 +42,7 @@ def parse_args():
         default=DEFAULT_SERVER_URL,
         help=f"Vision server endpoint URL (default: {DEFAULT_SERVER_URL})",
     )
-    default_ds = "./datasets/yolo" if Path("datasets/yolo").is_dir() else "./yolo_dataset"
+    default_ds = "./datasets/yolo"
     parser.add_argument(
         "--dataset-dir",
         default=default_ds,
@@ -91,14 +91,12 @@ def parse_args():
     )
     parser.add_argument(
         "--output-json",
-        "--json",
         dest="output_json",
         default=None,
         help="Optional path to export evaluation report as JSON",
     )
     parser.add_argument(
         "--coco-images",
-        "--num-coco-images",
         dest="coco_images",
         type=int,
         default=0,
@@ -118,7 +116,6 @@ def parse_args():
     )
     parser.add_argument(
         "--frigate-plus-images",
-        "--num-frigate-plus-images",
         dest="frigate_plus_images",
         type=int,
         default=0,

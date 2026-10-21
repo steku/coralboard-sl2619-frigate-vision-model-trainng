@@ -46,13 +46,7 @@ relocate_root_checkpoints() {
 CONFIG_FILE="config.yaml"
 RUNNER="local"                    # Default: local GPU training
 DEVICE="0"                        # Default: GPU '0'
-if [[ -f "datasets/data.yaml" || ( ! -f "datasets/yolo/data.yaml" && ! -f "yolo_dataset/data.yaml" ) ]]; then
-    DATA_YAML="datasets/data.yaml"
-elif [[ -f "datasets/yolo/data.yaml" ]]; then
-    DATA_YAML="datasets/yolo/data.yaml"
-else
-    DATA_YAML="yolo_dataset/data.yaml"
-fi
+DATA_YAML="datasets/data.yaml"
 IMGSZ=320                         # Strictly 320 for Coralboard SL2619 NSS slices
 EPOCHS=80
 PATIENCE=50
@@ -66,7 +60,7 @@ COS_LR="True"
 WARMUP_EPOCHS="5.0"
 WARMUP_MOMENTUM="0.5"
 WARMUP_BIAS_LR="0.0"
-PROJECT="frigate_coral"
+PROJECT="frigate"
 TARGET_FORMAT="torq"              # 'torq' (.vmfb for Coralboard NPU) or 'nvidia' (.onnx for NVIDIA GPU)
 BASE_MODEL="yolov8n.pt"
 RUN_NAME=""
@@ -97,7 +91,6 @@ DO_APPEND=true
 COCO_DATASET="coco128"
 USE_FRIGATE_PLUS=""
 FRIGATE_PLUS_DIR="datasets/frigate-plus"
-EXPLICIT_FRIGATE_PLUS_DIR=false
 
 # Output directories
 OUTPUT_DIR="output"
@@ -140,30 +133,12 @@ usage() {
     echo "  --device DEV            Training device ('0' local GPU, 'cpu', or '0,1' Spark)"
     echo "  --host USER@HOST        SSH destination for remote training"
     echo "  --resume                Resume/fine-tune from previous checkpoint (default: train from scratch)"
+    echo "  --replace               Wipe and replace existing dataset instead of appending"
     echo "  --coco-dataset NAME     COCO subset for co-training ('coco128' or 'coco-val2017')"
     echo "  --frigate-plus          Include Frigate+ dataset in training & validation splits"
     echo "  --no-frigate-plus       Exclude Frigate+ dataset from training splits"
-    echo "  --frigate-plus-dir DIR  Directory containing Frigate+ dataset (default: datasets/frigate-plus)"
-    echo "  --replace               Wipe and replace existing dataset instead of appending"
-    echo ""
-    echo "Fine-Tuning & Warm-Up Overrides (COCO-80 Domain Adaptation):"
-    echo "  --optimizer NAME        Optimizer (default: AdamW; avoids 'auto' overriding lr0)"
-    echo "  --lr0 FLOAT             Initial learning rate (default: 0.0005)"
-    echo "  --lrf FLOAT             Final learning rate multiplier (default: 0.01)"
-    echo "  --cos-lr BOOL           Use cosine LR scheduler (default: True)"
-    echo "  --warmup-epochs FLOAT   Warm-up epochs (default: 5.0)"
-    echo "  --warmup-momentum FLOAT Initial warm-up momentum (default: 0.5)"
-    echo "  --warmup-bias-lr FLOAT  Initial warm-up bias learning rate (default: 0.0)"
-    echo ""
-    echo "Advanced & Environment:"
-    echo "  -c, --config PATH       Path to YAML configuration file (default: config.yaml)"
-    echo "  --remote-dir DIR        Remote workspace directory on server"
-    echo "  --clean-images          Clean up training images on remote node after run completes"
-    echo "  --workers N             Dataloader CPU workers"
-    echo "  --cache MODE            Dataset cache mode ('ram', 'disk', 'false')"
-    echo "  --run-name NAME         Ultralytics run name (default: derived from base model)"
-    echo "  --patience N            Early stopping patience epochs (default: 50)"
     echo "  --extra-args ARGS       Forward extra arguments directly to 'yolo detect train'"
+    echo "  -c, --config PATH       Path to YAML configuration file (default: config.yaml)"
     echo "  -h, --help              Show this help message"
     echo ""
     exit "${exit_code}"
@@ -173,25 +148,12 @@ usage() {
 # Parse Arguments
 # ------------------------------------------------------------------------------
 PROFILE=""
-EXPLICIT_RUN_NAME=false
-EXPLICIT_LABELS_FILE=false
 EXPLICIT_HOST=false
 EXPLICIT_BATCH=false
 EXPLICIT_DEVICE=false
 EXPLICIT_EPOCHS=false
-EXPLICIT_PATIENCE=false
-EXPLICIT_WORKERS=false
-EXPLICIT_CACHE=false
 EXPLICIT_BASE_MODEL=false
 EXPLICIT_COCO=false
-EXPLICIT_OPTIMIZER=false
-EXPLICIT_LR0=false
-EXPLICIT_LRF=false
-EXPLICIT_COS_LR=false
-EXPLICIT_WARMUP_EPOCHS=false
-EXPLICIT_WARMUP_MOMENTUM=false
-EXPLICIT_WARMUP_BIAS_LR=false
-EXPLICIT_CLEAN_IMAGES=false
 EXPLICIT_DEPLOY_HOST=false
 EXPLICIT_DEPLOY_DIR=false
 
@@ -204,10 +166,6 @@ while [[ $# -gt 0 ]]; do
         --host)
             SPARK_HOST="$2"
             EXPLICIT_HOST=true
-            shift 2
-            ;;
-        --remote-dir)
-            REMOTE_DIR="$2"
             shift 2
             ;;
         -c|--config)
@@ -227,7 +185,7 @@ while [[ $# -gt 0 ]]; do
             DO_APPEND=false
             shift
             ;;
-        --coco-dataset|--coco)
+        --coco-dataset)
             COCO_DATASET="$2"
             EXPLICIT_COCO=true
             shift 2
@@ -239,15 +197,6 @@ while [[ $# -gt 0 ]]; do
         --no-frigate-plus)
             USE_FRIGATE_PLUS="false"
             shift
-            ;;
-        --frigate-plus-dir)
-            FRIGATE_PLUS_DIR="$2"
-            EXPLICIT_FRIGATE_PLUS_DIR=true
-            shift 2
-            ;;
-        --data-yaml)
-            DATA_YAML="$2"
-            shift 2
             ;;
         --compile)
             SKIP_TRAIN=true
@@ -272,69 +221,14 @@ while [[ $# -gt 0 ]]; do
             EXPLICIT_BATCH=true
             shift 2
             ;;
-        --workers)
-            WORKERS="$2"
-            EXPLICIT_WORKERS=true
-            shift 2
-            ;;
-        --cache)
-            CACHE="$2"
-            EXPLICIT_CACHE=true
-            shift 2
-            ;;
         --device)
             DEVICE="$2"
             EXPLICIT_DEVICE=true
             shift 2
             ;;
-        --run-name)
-            RUN_NAME="$2"
-            EXPLICIT_RUN_NAME=true
-            shift 2
-            ;;
         --resume)
             FROM_SCRATCH=false
             shift
-            ;;
-        --patience)
-            PATIENCE="$2"
-            EXPLICIT_PATIENCE=true
-            shift 2
-            ;;
-        --optimizer)
-            OPTIMIZER="$2"
-            EXPLICIT_OPTIMIZER=true
-            shift 2
-            ;;
-        --lr0)
-            LR0="$2"
-            EXPLICIT_LR0=true
-            shift 2
-            ;;
-        --lrf)
-            LRF="$2"
-            EXPLICIT_LRF=true
-            shift 2
-            ;;
-        --cos-lr)
-            COS_LR="$2"
-            EXPLICIT_COS_LR=true
-            shift 2
-            ;;
-        --warmup-epochs)
-            WARMUP_EPOCHS="$2"
-            EXPLICIT_WARMUP_EPOCHS=true
-            shift 2
-            ;;
-        --warmup-momentum)
-            WARMUP_MOMENTUM="$2"
-            EXPLICIT_WARMUP_MOMENTUM=true
-            shift 2
-            ;;
-        --warmup-bias-lr)
-            WARMUP_BIAS_LR="$2"
-            EXPLICIT_WARMUP_BIAS_LR=true
-            shift 2
             ;;
         --extra-args)
             EXTRA_TRAIN_ARGS="$2"
@@ -343,15 +237,6 @@ while [[ $# -gt 0 ]]; do
         --skip-compile)
             SKIP_COMPILE=true
             shift
-            ;;
-        --output-vmfb)
-            OUTPUT_VMFB="$2"
-            shift 2
-            ;;
-        --labels-file)
-            LABELS_FILE="$2"
-            EXPLICIT_LABELS_FILE=true
-            shift 2
             ;;
         --deploy)
             if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
@@ -373,11 +258,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pull)
             PULL_ONLY=true
-            shift
-            ;;
-        --clean-images)
-            CLEAN_IMAGES=true
-            EXPLICIT_CLEAN_IMAGES=true
             shift
             ;;
         -h|--help)
@@ -448,17 +328,9 @@ if [[ "${EXPLICIT_EPOCHS}" == "false" && -n "${PROFILE_EPOCHS}" ]]; then
     EPOCHS="${PROFILE_EPOCHS}"
 fi
 
-if [[ "${EXPLICIT_PATIENCE}" == "false" && -n "${PROFILE_PATIENCE}" ]]; then
-    PATIENCE="${PROFILE_PATIENCE}"
-fi
-
-if [[ "${EXPLICIT_WORKERS}" == "false" && -n "${PROFILE_WORKERS}" ]]; then
-    WORKERS="${PROFILE_WORKERS}"
-fi
-
-if [[ "${EXPLICIT_CACHE}" == "false" && -n "${PROFILE_CACHE}" ]]; then
-    CACHE="${PROFILE_CACHE}"
-fi
+[[ -n "${PROFILE_PATIENCE}" ]] && PATIENCE="${PROFILE_PATIENCE}"
+[[ -n "${PROFILE_WORKERS}" ]] && WORKERS="${PROFILE_WORKERS}"
+[[ -n "${PROFILE_CACHE}" ]] && CACHE="${PROFILE_CACHE}"
 
 if [[ "${EXPLICIT_BASE_MODEL}" == "false" && -n "${PROFILE_BASE_MODEL}" ]]; then
     BASE_MODEL="${PROFILE_BASE_MODEL}"
@@ -472,48 +344,20 @@ if [[ -z "${USE_FRIGATE_PLUS}" ]]; then
     USE_FRIGATE_PLUS="${PROFILE_FRIGATE_PLUS:-true}"
 fi
 
-if [[ "${EXPLICIT_FRIGATE_PLUS_DIR}" == "false" && -n "${PROFILE_FRIGATE_PLUS_DIR}" ]]; then
-    FRIGATE_PLUS_DIR="${PROFILE_FRIGATE_PLUS_DIR}"
-fi
+[[ -n "${PROFILE_FRIGATE_PLUS_DIR}" ]] && FRIGATE_PLUS_DIR="${PROFILE_FRIGATE_PLUS_DIR}"
 
 USE_FRIGATE_PLUS_PY="True"
 [[ "${USE_FRIGATE_PLUS}" == "false" ]] && USE_FRIGATE_PLUS_PY="False"
 
-if [[ "${EXPLICIT_OPTIMIZER}" == "false" && -n "${PROFILE_OPTIMIZER}" ]]; then
-    OPTIMIZER="${PROFILE_OPTIMIZER}"
-fi
-
-if [[ "${EXPLICIT_LR0}" == "false" && -n "${PROFILE_LR0}" ]]; then
-    LR0="${PROFILE_LR0}"
-fi
-
-if [[ "${EXPLICIT_LRF}" == "false" && -n "${PROFILE_LRF}" ]]; then
-    LRF="${PROFILE_LRF}"
-fi
-
-if [[ "${EXPLICIT_COS_LR}" == "false" && -n "${PROFILE_COS_LR}" ]]; then
-    COS_LR="${PROFILE_COS_LR}"
-fi
-
-if [[ "${EXPLICIT_WARMUP_EPOCHS}" == "false" && -n "${PROFILE_WARMUP_EPOCHS}" ]]; then
-    WARMUP_EPOCHS="${PROFILE_WARMUP_EPOCHS}"
-fi
-
-if [[ "${EXPLICIT_WARMUP_MOMENTUM}" == "false" && -n "${PROFILE_WARMUP_MOMENTUM}" ]]; then
-    WARMUP_MOMENTUM="${PROFILE_WARMUP_MOMENTUM}"
-fi
-
-if [[ "${EXPLICIT_WARMUP_BIAS_LR}" == "false" && -n "${PROFILE_WARMUP_BIAS_LR}" ]]; then
-    WARMUP_BIAS_LR="${PROFILE_WARMUP_BIAS_LR}"
-fi
-
-if [[ "${EXPLICIT_CLEAN_IMAGES}" == "false" && "${PROFILE_CLEAN_IMAGES:-false}" == "true" ]]; then
-    CLEAN_IMAGES=true
-fi
-
-if [[ -n "${PROFILE_REMOTE_DIR}" ]]; then
-    REMOTE_DIR="${PROFILE_REMOTE_DIR}"
-fi
+[[ -n "${PROFILE_OPTIMIZER}" ]] && OPTIMIZER="${PROFILE_OPTIMIZER}"
+[[ -n "${PROFILE_LR0}" ]] && LR0="${PROFILE_LR0}"
+[[ -n "${PROFILE_LRF}" ]] && LRF="${PROFILE_LRF}"
+[[ -n "${PROFILE_COS_LR}" ]] && COS_LR="${PROFILE_COS_LR}"
+[[ -n "${PROFILE_WARMUP_EPOCHS}" ]] && WARMUP_EPOCHS="${PROFILE_WARMUP_EPOCHS}"
+[[ -n "${PROFILE_WARMUP_MOMENTUM}" ]] && WARMUP_MOMENTUM="${PROFILE_WARMUP_MOMENTUM}"
+[[ -n "${PROFILE_WARMUP_BIAS_LR}" ]] && WARMUP_BIAS_LR="${PROFILE_WARMUP_BIAS_LR}"
+[[ "${PROFILE_CLEAN_IMAGES:-false}" == "true" ]] && CLEAN_IMAGES=true
+[[ -n "${PROFILE_REMOTE_DIR}" ]] && REMOTE_DIR="${PROFILE_REMOTE_DIR}"
 
 if [[ "${EXPLICIT_DEPLOY_HOST}" == "false" && -z "${DEPLOY_HOST}" && -n "${PROFILE_DEPLOY_HOST}" && "${TARGET_FORMAT}" != "nvidia" ]]; then
     DEPLOY_HOST="${PROFILE_DEPLOY_HOST}"
@@ -526,23 +370,13 @@ fi
 # ------------------------------------------------------------------------------
 # Normalize Model Names & Dynamic Defaults
 # ------------------------------------------------------------------------------
+TIMESTAMP="$(date +%y%m%d-%H%M)"
 BASE_MODEL_NAME="$(basename "${BASE_MODEL%.*}")"
-if [[ "${EXPLICIT_RUN_NAME}" == "false" ]]; then
-    RUN_NAME="${BASE_MODEL_NAME}"
-fi
+RUN_NAME="${BASE_MODEL_NAME}"
 RUN_NAME_STEM="$(basename "${RUN_NAME%.*}")"
-
-if [[ "${EXPLICIT_LABELS_FILE}" == "false" ]]; then
-    LABELS_FILE="${MODELS_LABELS_DIR}/labels_${BASE_MODEL_NAME}.json"
-fi
-
-if [[ -z "${OUTPUT_VMFB}" ]]; then
-    OUTPUT_VMFB="${MODELS_COMPILED_DIR}/custom_${RUN_NAME_STEM}.vmfb"
-fi
-
-if [[ -z "${OUTPUT_ONNX}" ]]; then
-    OUTPUT_ONNX="${MODELS_COMPILED_DIR}/custom_${RUN_NAME_STEM}.onnx"
-fi
+LABELS_FILE="${MODELS_LABELS_DIR}/${TARGET_FORMAT}_${BASE_MODEL_NAME}_${TIMESTAMP}.json"
+OUTPUT_VMFB="${MODELS_COMPILED_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}_${TIMESTAMP}.vmfb"
+OUTPUT_ONNX="${MODELS_COMPILED_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}_${TIMESTAMP}.onnx"
 
 # Resolve deployment overrides
 if [[ "${SKIP_DEPLOY}" == "true" ]]; then
@@ -617,7 +451,7 @@ if [[ "${DO_EXPORT}" == "true" ]]; then
         EXPORT_CMD+=(--frigate-plus-dir "${FRIGATE_PLUS_DIR}")
     fi
     DATA_DIR="$(dirname "${DATA_YAML}")"
-    if [[ "${DATA_DIR}" != "." && "${DATA_DIR}" != "datasets/yolo" && "${DATA_DIR}" != "yolo_dataset" ]]; then
+    if [[ "${DATA_DIR}" != "." && "${DATA_DIR}" != "datasets" && "${DATA_DIR}" != "datasets/yolo" && "${DATA_DIR}" != "yolo_dataset" ]]; then
         EXPORT_CMD+=(--output-dir "${DATA_DIR}")
     fi
     log_info "Running: ${EXPORT_CMD[*]}"
@@ -715,6 +549,9 @@ elif [[ "${RUNNER}" == "spark" ]]; then
                 "${SPARK_HOST}:${REMOTE_DIR}/"
 
             ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/datasets'"
+            if [[ -f "datasets/data.yaml" ]]; then
+                rsync -avz "datasets/data.yaml" "${SPARK_HOST}:${REMOTE_DIR}/datasets/data.yaml"
+            fi
             rsync -avz --delete \
                 --exclude="coco*" \
                 --exclude="*.zip" \
@@ -741,8 +578,8 @@ elif [[ "${RUNNER}" == "spark" ]]; then
 
         # Sync previous checkpoint if resuming or base model if present locally
         if [[ "${FROM_SCRATCH}" == "false" && -f "${LOCAL_WEIGHTS_DIR}/best.pt" ]]; then
-            ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/runs/detect/frigate_coral/${RUN_NAME}/weights'"
-            scp "${LOCAL_WEIGHTS_DIR}/best.pt" "${SPARK_HOST}:${REMOTE_DIR}/runs/detect/frigate_coral/${RUN_NAME}/weights/best.pt"
+            ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/runs/detect/${PROJECT}/${RUN_NAME}/weights'"
+            scp "${LOCAL_WEIGHTS_DIR}/best.pt" "${SPARK_HOST}:${REMOTE_DIR}/runs/detect/${PROJECT}/${RUN_NAME}/weights/best.pt"
         fi
         if [[ -f "models/base/${BASE_MODEL}" ]]; then
             scp "models/base/${BASE_MODEL}" "${SPARK_HOST}:${REMOTE_DIR}/models/base/"
@@ -774,7 +611,7 @@ elif [[ "${RUNNER}" == "spark" ]]; then
             fi
 
             if [ \"${FROM_SCRATCH}\" = \"false\" ]; then
-                LATEST_EXISTING=\$(find \"${REMOTE_DIR}/runs/detect/frigate_coral\" -path \"*${RUN_NAME}*\" -name \"best.pt\" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d' ')
+                LATEST_EXISTING=\$(find \"${REMOTE_DIR}/runs/detect/${PROJECT}\" -path \"*${RUN_NAME}*\" -name \"best.pt\" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d' ')
                 if [ -n \"\${LATEST_EXISTING}\" ] && [ -f \"\${LATEST_EXISTING}\" ]; then
                     echo \"[SPARK] Resuming training from existing checkpoint: \${LATEST_EXISTING}\"
                     START_MODEL=\"\${LATEST_EXISTING}\"
@@ -801,7 +638,7 @@ elif [[ "${RUNNER}" == "spark" ]]; then
                 warmup_momentum=${WARMUP_MOMENTUM} \
                 warmup_bias_lr=${WARMUP_BIAS_LR} \
                 device='${DEVICE}' \
-                project='frigate_coral' \
+                project='${PROJECT}' \
                 name='${RUN_NAME}' \
                 ${EXTRA_TRAIN_ARGS}
         "
@@ -812,11 +649,11 @@ elif [[ "${RUNNER}" == "spark" ]]; then
     mkdir -p "${LOCAL_WEIGHTS_DIR}" "models/base"
 
     REMOTE_BEST_PT=$(ssh "${SPARK_HOST}" "
-        find \"${REMOTE_DIR}/runs/detect/frigate_coral\" -path \"*${RUN_NAME}*\" -name \"best.pt\" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d' '
+        find \"${REMOTE_DIR}/runs/detect/${PROJECT}\" -path \"*${RUN_NAME}*\" -name \"best.pt\" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d' '
     ")
 
     if [[ -z "${REMOTE_BEST_PT}" ]]; then
-        log_err "Could not locate best.pt on ${SPARK_HOST}:${REMOTE_DIR}/runs/detect/frigate_coral/"
+        log_err "Could not locate best.pt on ${SPARK_HOST}:${REMOTE_DIR}/runs/detect/${PROJECT}/"
         exit 1
     fi
 
@@ -947,7 +784,7 @@ cp -f "${EXPORTED_ONNX}" "${OUTPUT_DIR}/best.onnx"
 if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
     mkdir -p "$(dirname "${OUTPUT_ONNX}")"
     cp -f "${EXPORTED_ONNX}" "${OUTPUT_ONNX}"
-    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}')"
+    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}', target='${TARGET_FORMAT}')"
     log_success "NVIDIA GPU ONNX model generated successfully: ${OUTPUT_ONNX} ($(du -h "${OUTPUT_ONNX}" | cut -f1))"
     log_info "Target is NVIDIA GPU ('${TARGET_FORMAT}'): skipping Torq NPU INT8 quantization and .vmfb compilation."
     PRIMARY_ARTIFACT="${OUTPUT_ONNX}"
@@ -961,7 +798,8 @@ else
         --output-labels "${LABELS_FILE}" \
         --data-yaml "${DATA_YAML}" \
         --imgsz "${IMGSZ}" \
-        --base-model-name "${BASE_MODEL_NAME}"
+        --base-model-name "${BASE_MODEL_NAME}" \
+        --target "${TARGET_FORMAT}"
 
     log_info "Executing Full INT8 Quantization via onnx2tf..."
     rm -rf "${OUTPUT_DIR}/onnx2tf_normalized_full_int8"
@@ -981,10 +819,10 @@ else
     fi
 
     # Update labels with exact TFLite quantization scales/zero points
-    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '${FULL_INT8_TFLITE}', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}')"
+    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '${FULL_INT8_TFLITE}', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}', target='${TARGET_FORMAT}')"
 
     log_info "Converting TFLite to TOSA MLIR..."
-    TOSA_MLIR="${OUTPUT_DIR}/custom_${RUN_NAME_STEM}_normalized_full_integer.tosa.mlir"
+    TOSA_MLIR="${OUTPUT_DIR}/${RUN_NAME_STEM}_normalized_full_integer.tosa.mlir"
     tosa-converter-for-tflite \
         "${FULL_INT8_TFLITE}" \
         --text \
@@ -1005,23 +843,53 @@ else
 fi
 
 # ------------------------------------------------------------------------------
+# Create Non-Timestamped Soft Links
+# ------------------------------------------------------------------------------
+MODEL_EXT="${PRIMARY_ARTIFACT##*.}"
+MODEL_SYMLINK="${MODELS_COMPILED_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}.${MODEL_EXT}"
+ln -sf "$(basename "${PRIMARY_ARTIFACT}")" "${MODEL_SYMLINK}"
+log_info "Created soft link: ${MODEL_SYMLINK} -> $(basename "${PRIMARY_ARTIFACT}")"
+
+LABELS_JSON_SYMLINK="${MODELS_LABELS_DIR}/${TARGET_FORMAT}_${BASE_MODEL_NAME}.json"
+ln -sf "$(basename "${LABELS_FILE}")" "${LABELS_JSON_SYMLINK}"
+log_info "Created soft link: ${LABELS_JSON_SYMLINK} -> $(basename "${LABELS_FILE}")"
+
+LABELS_TXT_FILE="${LABELS_FILE%.json}.txt"
+LABELS_TXT_SYMLINK="${MODELS_LABELS_DIR}/${TARGET_FORMAT}_${BASE_MODEL_NAME}.txt"
+if [[ -f "${LABELS_TXT_FILE}" ]]; then
+    ln -sf "$(basename "${LABELS_TXT_FILE}")" "${LABELS_TXT_SYMLINK}"
+    log_info "Created soft link: ${LABELS_TXT_SYMLINK} -> $(basename "${LABELS_TXT_FILE}")"
+fi
+
+ln -sf "$(basename "${LABELS_FILE}")" "${MODELS_LABELS_DIR}/labels.json"
+if [[ -f "${LABELS_TXT_FILE}" ]]; then
+    ln -sf "$(basename "${LABELS_TXT_FILE}")" "${MODELS_LABELS_DIR}/labels.txt"
+fi
+
+# ------------------------------------------------------------------------------
 # Step 4: Optional Deployment
 # ------------------------------------------------------------------------------
 if [[ "${SKIP_DEPLOY}" == "false" ]]; then
     ARTIFACT_BASENAME="$(basename "${PRIMARY_ARTIFACT}")"
+    MODEL_SYMLINK_BASENAME="$(basename "${MODEL_SYMLINK}")"
     LABELS_BASENAME="$(basename "${LABELS_FILE}")"
+    LABELS_JSON_SYMLINK_BASENAME="$(basename "${LABELS_JSON_SYMLINK}")"
     LABELS_TXT_FILE="${LABELS_FILE%.json}.txt"
     LABELS_TXT_BASENAME="$(basename "${LABELS_TXT_FILE}")"
+    LABELS_TXT_SYMLINK_BASENAME="$(basename "${LABELS_TXT_SYMLINK}")"
 
     if [[ -n "${DEPLOY_DIR}" ]]; then
         echo ""
         log_info "Deploying artifacts to local directory: ${DEPLOY_DIR}..."
         mkdir -p "${DEPLOY_DIR}"
         cp -f "${PRIMARY_ARTIFACT}" "${DEPLOY_DIR}/${ARTIFACT_BASENAME}"
+        cp -f "${PRIMARY_ARTIFACT}" "${DEPLOY_DIR}/${MODEL_SYMLINK_BASENAME}"
         cp -f "${LABELS_FILE}" "${DEPLOY_DIR}/${LABELS_BASENAME}"
+        cp -f "${LABELS_FILE}" "${DEPLOY_DIR}/${LABELS_JSON_SYMLINK_BASENAME}"
         cp -f "${LABELS_FILE}" "${DEPLOY_DIR}/labels.json"
         if [[ -f "${LABELS_TXT_FILE}" ]]; then
             cp -f "${LABELS_TXT_FILE}" "${DEPLOY_DIR}/${LABELS_TXT_BASENAME}"
+            cp -f "${LABELS_TXT_FILE}" "${DEPLOY_DIR}/${LABELS_TXT_SYMLINK_BASENAME}"
             cp -f "${LABELS_TXT_FILE}" "${DEPLOY_DIR}/labels.txt"
         fi
         log_success "Deployed ${ARTIFACT_BASENAME}, ${LABELS_BASENAME}, and ${LABELS_TXT_BASENAME} to ${DEPLOY_DIR}/"
@@ -1032,10 +900,13 @@ if [[ "${SKIP_DEPLOY}" == "false" ]]; then
         CLEAN_HOST="${DEPLOY_HOST%/}"
         log_info "Deploying artifacts via SCP to ${CLEAN_HOST}..."
         scp "${PRIMARY_ARTIFACT}" "${CLEAN_HOST}/${ARTIFACT_BASENAME}"
+        scp "${PRIMARY_ARTIFACT}" "${CLEAN_HOST}/${MODEL_SYMLINK_BASENAME}"
         scp "${LABELS_FILE}" "${CLEAN_HOST}/${LABELS_BASENAME}"
+        scp "${LABELS_FILE}" "${CLEAN_HOST}/${LABELS_JSON_SYMLINK_BASENAME}"
         scp "${LABELS_FILE}" "${CLEAN_HOST}/labels.json"
         if [[ -f "${LABELS_TXT_FILE}" ]]; then
             scp "${LABELS_TXT_FILE}" "${CLEAN_HOST}/${LABELS_TXT_BASENAME}"
+            scp "${LABELS_TXT_FILE}" "${CLEAN_HOST}/${LABELS_TXT_SYMLINK_BASENAME}"
             scp "${LABELS_TXT_FILE}" "${CLEAN_HOST}/labels.txt"
         fi
         log_success "Deployed ${ARTIFACT_BASENAME}, ${LABELS_BASENAME}, and ${LABELS_TXT_BASENAME} via SCP to ${CLEAN_HOST}!"
@@ -1052,15 +923,19 @@ if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
     echo "=========================================================================="
     echo "Artifacts Generated:"
     echo "  1. ONNX Model      : ${OUTPUT_ONNX} ($(du -h "${OUTPUT_ONNX}" | cut -f1))"
+    echo "     Soft Link       : ${MODEL_SYMLINK}"
 else
     echo -e "${GREEN}  PIPELINE COMPLETE - MODEL READY FOR NPU INFERENCE!${NC}"
     echo "=========================================================================="
     echo "Artifacts Generated:"
     echo "  1. Hardware Binary : ${OUTPUT_VMFB} ($(du -h "${OUTPUT_VMFB}" | cut -f1))"
+    echo "     Soft Link       : ${MODEL_SYMLINK}"
 fi
 echo "  2. Label Metadata  : ${LABELS_FILE}"
+echo "     Soft Link       : ${LABELS_JSON_SYMLINK}"
 if [[ -f "${LABELS_FILE%.json}.txt" ]]; then
     echo "  3. Frigate Labelmap: ${LABELS_FILE%.json}.txt"
+    echo "     Soft Link       : ${LABELS_TXT_SYMLINK}"
     echo "  4. PyTorch Weights : ${WEIGHTS_PATH}"
 else
     echo "  3. PyTorch Weights : ${WEIGHTS_PATH}"
