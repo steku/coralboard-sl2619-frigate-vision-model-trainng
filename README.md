@@ -98,12 +98,32 @@ torq-compile --version
 
 ### 4. Optional: Hailo-10H Python 3.10 Environment (`./venv-hailo-310`)
 
-When targeting **Hailo-10H** (`-p hailo` or `-p hailo-spark`), the Hailo Dataflow Compiler (`hailo_dataflow_compiler` v5.3.0) and Hailo Model Zoo (`hailo_model_zoo` v2.19.0) run in a dedicated **Python 3.10** virtual environment (`./venv-hailo-310`):
+When targeting **Hailo-10H** (`-p hailo` or `-p hailo-spark`), the Hailo Dataflow Compiler (`hailo_dataflow_compiler` v5.3.0) and Hailo Model Zoo (`hailo_model_zoo` v2.19.0) require a dedicated **Python 3.10** virtual environment (`./venv-hailo-310`) and system build libraries:
 
 ```bash
+# 1. Install system dependencies and Python 3.10 (or via uv / pyenv)
+sudo apt update && sudo apt install -y graphviz libgraphviz-dev python3-tk
+
+# Create venv-hailo-310 using python3.10 (or: uv venv --python 3.10 venv-hailo-310 --seed)
 python3.10 -m venv venv-hailo-310
-./venv-hailo-310/bin/pip install --upgrade pip
-./venv-hailo-310/bin/pip install packages/hailo_dataflow_compiler-5.3.0-cp310-cp310-linux_x86_64.whl packages/hailo_model_zoo-2.19.0-py3-none-any.whl
+
+# 2. Install build prerequisites and pre-compile lap
+./venv-hailo-310/bin/pip install --upgrade pip "setuptools<70" wheel cython "numpy<2.0"
+./venv-hailo-310/bin/pip install --no-build-isolation lap==0.4.0
+
+# 3. Install Hailo Dataflow Compiler and Hailo Model Zoo wheels from packages/
+./venv-hailo-310/bin/pip install \
+  packages/hailo_dataflow_compiler-5.3.0-cp310-cp310-linux_x86_64.whl \
+  packages/hailo_model_zoo-2.19.0-py3-none-any.whl
+
+# 4. (Optional, for local GPU quantization) Link CUDA libdevice.10.bc into venv root for XLA:
+mkdir -p venv-hailo-310/nvvm/libdevice
+ln -sf $(find venv-hailo-310/lib/python3.10/site-packages/nvidia -name "libdevice.10.bc" | head -n 1) \
+  venv-hailo-310/nvvm/libdevice/libdevice.10.bc
+
+# 5. Verify Hailo CLI tools
+./venv-hailo-310/bin/hailo --version
+./venv-hailo-310/bin/hailomz --version
 ```
 
 `train.sh` automatically invokes `./venv-hailo-310/bin/hailomz` during postprocessing and checks available local GPU VRAM before quantization—automatically falling back to CPU (`CUDA_VISIBLE_DEVICES=""`) if free GPU memory is below 6000 MiB.
