@@ -18,6 +18,36 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
+PIPELINE_START_TS=$(date +%s)
+PREPROCESS_START_TS=${PIPELINE_START_TS}
+PREPROCESS_ELAPSED=0
+TRAINING_ELAPSED=0
+POSTPROCESS_START_TS=${PIPELINE_START_TS}
+POSTPROCESS_ELAPSED=0
+
+format_duration() {
+    local total_sec="${1:-0}"
+    local hrs=$((total_sec / 3600))
+    local mins=$(((total_sec % 3600) / 60))
+    local secs=$((total_sec % 60))
+    if (( hrs > 0 )); then
+        printf "%dh %02dm %02ds (%ds)" "${hrs}" "${mins}" "${secs}" "${total_sec}"
+    elif (( mins > 0 )); then
+        printf "%dm %02ds (%ds)" "${mins}" "${secs}" "${total_sec}"
+    else
+        printf "%ds" "${secs}"
+    fi
+}
+
+print_timing_report() {
+    local total_elapsed=$((PREPROCESS_ELAPSED + TRAINING_ELAPSED + POSTPROCESS_ELAPSED))
+    echo "Timing Summary:"
+    echo "  Preprocessing  : $(format_duration "${PREPROCESS_ELAPSED}")"
+    echo "  Training       : $(format_duration "${TRAINING_ELAPSED}")"
+    echo "  Postprocessing : $(format_duration "${POSTPROCESS_ELAPSED}")"
+    echo "  Total Time     : $(format_duration "${total_elapsed}")"
+}
+
 # ------------------------------------------------------------------------------
 # Colors for logging
 # ------------------------------------------------------------------------------
@@ -486,6 +516,9 @@ if [[ -n "${CUSTOM_MODEL_PT}" ]]; then
     fi
     WEIGHTS_PATH="${CUSTOM_MODEL_PT}"
     log_info "Using specified checkpoint: ${WEIGHTS_PATH}"
+    PREPROCESS_ELAPSED=$(( $(date +%s) - PREPROCESS_START_TS ))
+    TRAINING_ELAPSED=0
+    POSTPROCESS_START_TS=$(date +%s)
 
 elif [[ "${SKIP_TRAIN}" == "true" ]]; then
     # Look for existing best.pt
@@ -499,6 +532,9 @@ elif [[ "${SKIP_TRAIN}" == "true" ]]; then
     fi
     WEIGHTS_PATH="${LATEST_BEST}"
     log_info "Using existing checkpoint: ${WEIGHTS_PATH}"
+    PREPROCESS_ELAPSED=$(( $(date +%s) - PREPROCESS_START_TS ))
+    TRAINING_ELAPSED=0
+    POSTPROCESS_START_TS=$(date +%s)
 
 elif [[ "${RUNNER}" == "spark" ]]; then
     # --------------------------------------------------------------------------
@@ -536,6 +572,9 @@ elif [[ "${RUNNER}" == "spark" ]]; then
 
     if [[ "${PULL_ONLY}" == "true" ]]; then
         log_info "--pull specified: skipping remote execution, pulling existing weights from Spark..."
+        PREPROCESS_ELAPSED=$(( $(date +%s) - PREPROCESS_START_TS ))
+        TRAINING_ELAPSED=0
+        POSTPROCESS_START_TS=$(date +%s)
     else
         # Setup remote venv if missing
         ssh "${SPARK_HOST}" "
@@ -613,6 +652,8 @@ elif [[ "${RUNNER}" == "spark" ]]; then
         "
 
         # Launch training on Spark
+        PREPROCESS_ELAPSED=$(( $(date +%s) - PREPROCESS_START_TS ))
+        TRAIN_START_TS=$(date +%s)
         log_info "Launching YOLO fine-tuning on ${SPARK_HOST} (device=${DEVICE}, batch=${BATCH}, optimizer=${OPTIMIZER}, lr0=${LR0}, warmup=${WARMUP_EPOCHS})..."
         ssh -t "${SPARK_HOST}" "
             set -e
@@ -657,6 +698,8 @@ elif [[ "${RUNNER}" == "spark" ]]; then
                 name='${RUN_NAME}' \
                 ${EXTRA_TRAIN_ARGS}
         "
+        TRAINING_ELAPSED=$(( $(date +%s) - TRAIN_START_TS ))
+        POSTPROCESS_START_TS=$(date +%s)
     fi
 
     # Retrieve trained weights directly from Spark to local system before local compilation
@@ -718,6 +761,8 @@ else
         fi
     fi
 
+    PREPROCESS_ELAPSED=$(( $(date +%s) - PREPROCESS_START_TS ))
+    TRAIN_START_TS=$(date +%s)
     log_info "Executing: yolo detect train on device='${DEVICE}' (optimizer=${OPTIMIZER}, lr0=${LR0}, warmup=${WARMUP_EPOCHS})..."
     yolo detect train \
         data="${DATA_YAML}" \
@@ -739,6 +784,8 @@ else
         project="${PROJECT}" \
         name="${RUN_NAME}" \
         ${EXTRA_TRAIN_ARGS}
+    TRAINING_ELAPSED=$(( $(date +%s) - TRAIN_START_TS ))
+    POSTPROCESS_START_TS=$(date +%s)
 
     # Relocate downloaded base weights
     relocate_root_checkpoints
@@ -759,7 +806,12 @@ fi
 # Step 3: Model Export & Target Compilation
 # ------------------------------------------------------------------------------
 if [[ "${SKIP_COMPILE}" == "true" ]]; then
+    POSTPROCESS_ELAPSED=$(( $(date +%s) - POSTPROCESS_START_TS ))
     log_info "--skip-compile specified: exiting pipeline before compilation."
+    echo ""
+    echo "=========================================================================="
+    print_timing_report
+    echo "=========================================================================="
     exit 0
 fi
 
@@ -1047,4 +1099,7 @@ if [[ -f "${LABELS_FILE%.json}.txt" ]]; then
 else
     echo "  3. PyTorch Weights : ${WEIGHTS_PATH}"
 fi
+POSTPROCESS_ELAPSED=$(( $(date +%s) - POSTPROCESS_START_TS ))
+echo "--------------------------------------------------------------------------"
+print_timing_report
 echo "=========================================================================="
