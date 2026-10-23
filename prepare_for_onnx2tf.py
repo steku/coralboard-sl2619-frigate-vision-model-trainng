@@ -334,6 +334,25 @@ def step3_prepare_calibration(
     summary = ", ".join(f"{names.get(c, str(c))}:{cnt}" for c, cnt in sorted(class_counts.items()))
     print(f"    Selected {len(selected_paths)} calibration images. Class instances: {summary if summary else 'None'}")
 
+    if not str(calib_out).endswith(".npy"):
+        import shutil
+        calib_dir = Path(calib_out)
+        if calib_dir.exists():
+            shutil.rmtree(calib_dir)
+        calib_dir.mkdir(parents=True, exist_ok=True)
+        saved_count = 0
+        for idx, p in enumerate(selected_paths):
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                shutil.copy2(p, calib_dir / f"{idx:04d}_{p.name}")
+                saved_count += 1
+            else:
+                img = cv2.imread(str(p))
+                if img is not None:
+                    cv2.imwrite(str(calib_dir / f"{idx:04d}_{p.stem}.jpg"), img)
+                    saved_count += 1
+        print(f"    Calibration image directory prepared at: {calib_dir} ({saved_count} JPEG/PNG images)")
+        return
+
     samples = []
     for p in selected_paths:
         image = cv2.imread(str(p))
@@ -365,6 +384,7 @@ def step4_generate_labels_json(
     model_name: str = "YOLO",
     base_model_name: str = None,
     target: str = "torq",
+    imgsz: int = 320,
 ):
     names = load_dataset_metadata(data_yaml_path)
     resolved_base = base_model_name or model_name
@@ -383,7 +403,7 @@ def step4_generate_labels_json(
         "stride": 32,
         "task": "detect",
         "batch": 1,
-        "imgsz": [320, 320],
+        "imgsz": [imgsz, imgsz],
         "names": {str(k): v for k, v in names.items()},
     }
 
@@ -489,13 +509,14 @@ def main():
     parser.add_argument("--calib-seed", type=int, default=42, help="Random seed for calibration selection (default: 42)")
     parser.add_argument("--base-model-name", default=None, help="Base model name (default: derived from model-pt or YOLO)")
     parser.add_argument("--skip-export", action="store_true", help="Skip ONNX export (use existing input-onnx)")
-    parser.add_argument("--target", default="torq", choices=["torq", "nvidia"], help="Target format (default: torq)")
+    parser.add_argument("--target", default="torq", choices=["torq", "nvidia", "hailo"], help="Target format (default: torq)")
 
     args = parser.parse_args()
 
     if not args.skip_export:
         step1_export_onnx(args.model_pt, args.input_onnx, args.imgsz)
-    step2_normalize_output(args.input_onnx, args.output_onnx, args.imgsz)
+    if args.target != "hailo":
+        step2_normalize_output(args.input_onnx, args.output_onnx, args.imgsz)
     step3_prepare_calibration(
         args.data_yaml,
         args.output_calib,
@@ -517,7 +538,7 @@ def main():
         else:
             output_labels = f"{args.target}_{detected_name}_{timestamp}.json"
 
-    step4_generate_labels_json(args.data_yaml, output_labels, model_name=detected_name, base_model_name=detected_name, target=args.target)
+    step4_generate_labels_json(args.data_yaml, output_labels, model_name=detected_name, base_model_name=detected_name, target=args.target, imgsz=args.imgsz)
     print(f"Pre-conversion preparation finished successfully! Labels written to: {output_labels}")
 
 

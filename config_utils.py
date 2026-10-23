@@ -127,6 +127,7 @@ def load_dataset_classes(data_yaml_path: str = "datasets/data.yaml") -> Dict[int
             candidates = [
                 labels_dir / "torq_yolov8n.json",
                 labels_dir / "nvidia_yolov9s.json",
+                labels_dir / "hailo_yolov8m.json",
                 labels_dir / "labels.json",
             ] + sorted(labels_dir.glob("*.json"))
             for f in candidates:
@@ -579,15 +580,29 @@ def get_profile(
     raw_target = str(
         p_data.get("target")
         or p_data.get("output_format")
-        or ("nvidia" if "nvidia" in target_name or target_name == "onnx" else "torq")
+        or ("hailo" if "hailo" in target_name else ("nvidia" if "nvidia" in target_name or target_name == "onnx" else "torq"))
     ).strip().lower()
     if raw_target in ("nvidia", "onnx", "gpu", "tensorrt"):
         target = "nvidia"
+    elif raw_target in ("hailo", "hailo10h", "hef"):
+        target = "hailo"
     else:
         target = "torq"
 
-    default_base_model = "yolov9s.pt" if target == "nvidia" else "yolov8n.pt"
+    if target == "nvidia":
+        default_base_model = "yolov9s.pt"
+    elif target == "hailo":
+        default_base_model = "yolov8m.pt"
+    else:
+        default_base_model = "yolov8n.pt"
     base_model = str(p_data.get("base_model") or default_base_model)
+
+    default_imgsz = 640 if target == "hailo" else 320
+    try:
+        imgsz = int(p_data.get("imgsz", default_imgsz))
+    except (TypeError, ValueError):
+        imgsz = default_imgsz
+    hw_arch = str(p_data.get("hw_arch") or ("hailo10h" if target == "hailo" else "SL2610"))
     clean_images = bool(p_data.get("clean_images", False))
 
     coco_cfg = cfg.get("coco", {}) or {}
@@ -626,7 +641,7 @@ def get_profile(
         warmup_bias_lr = 0.0
 
     dep_cfg = cfg.get("deployment", {}) or {}
-    if target == "nvidia":
+    if target in ("nvidia", "hailo"):
         deploy_host = str(p_data.get("deploy_host") or "")
         deploy_dir = str(p_data.get("deploy_dir") or "")
     else:
@@ -650,6 +665,8 @@ def get_profile(
         "epochs": epochs,
         "patience": patience,
         "base_model": base_model,
+        "imgsz": imgsz,
+        "hw_arch": hw_arch,
         "coco_dataset": coco_dataset,
         "clean_images": clean_images,
         "optimizer": optimizer,
@@ -685,6 +702,8 @@ def dump_profile_env(
         f"PROFILE_EPOCHS='{p['epochs']}'",
         f"PROFILE_PATIENCE='{p['patience']}'",
         f"PROFILE_BASE_MODEL='{p['base_model']}'",
+        f"PROFILE_IMGSZ='{p['imgsz']}'",
+        f"PROFILE_HW_ARCH='{p['hw_arch']}'",
         f"PROFILE_COCO_DATASET='{p['coco_dataset']}'",
         f"PROFILE_CLEAN_IMAGES='{'true' if p['clean_images'] else 'false'}'",
         f"PROFILE_OPTIMIZER='{p['optimizer']}'",

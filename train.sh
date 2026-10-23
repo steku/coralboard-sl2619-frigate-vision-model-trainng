@@ -114,7 +114,7 @@ usage() {
     echo "quantizes to INT8, compiles to Torq NPU binary, and deploys if configured."
     echo ""
     echo "Execution Profiles:"
-    echo "  -p, --profile NAME      Select profile from config.yaml (e.g. 'torq', 'spark-torq', 'spark-torq-yolo26n', 'nvidia', 'spark-nvidia', 'cpu-torq')"
+    echo "  -p, --profile NAME      Select profile from config.yaml (e.g. 'torq', 'spark-torq', 'spark-torq-yolo26n', 'nvidia', 'spark-nvidia', 'hailo', 'spark-hailo', 'cpu-torq')"
     echo ""
     echo "Primary Workflows:"
     echo "  --compile [MODEL.pt]    Skip training; compile checkpoint directly (or latest best.pt)"
@@ -336,6 +336,9 @@ if [[ "${EXPLICIT_BASE_MODEL}" == "false" && -n "${PROFILE_BASE_MODEL}" ]]; then
     BASE_MODEL="${PROFILE_BASE_MODEL}"
 fi
 
+[[ -n "${PROFILE_IMGSZ}" ]] && IMGSZ="${PROFILE_IMGSZ}"
+HW_ARCH="${PROFILE_HW_ARCH:-SL2610}"
+
 if [[ "${EXPLICIT_COCO}" == "false" && -n "${PROFILE_COCO_DATASET}" ]]; then
     COCO_DATASET="${PROFILE_COCO_DATASET}"
 fi
@@ -359,11 +362,11 @@ USE_FRIGATE_PLUS_PY="True"
 [[ "${PROFILE_CLEAN_IMAGES:-false}" == "true" ]] && CLEAN_IMAGES=true
 [[ -n "${PROFILE_REMOTE_DIR}" ]] && REMOTE_DIR="${PROFILE_REMOTE_DIR}"
 
-if [[ "${EXPLICIT_DEPLOY_HOST}" == "false" && -z "${DEPLOY_HOST}" && -n "${PROFILE_DEPLOY_HOST}" && "${TARGET_FORMAT}" != "nvidia" ]]; then
+if [[ "${EXPLICIT_DEPLOY_HOST}" == "false" && -z "${DEPLOY_HOST}" && -n "${PROFILE_DEPLOY_HOST}" && "${TARGET_FORMAT}" == "torq" ]]; then
     DEPLOY_HOST="${PROFILE_DEPLOY_HOST}"
 fi
 
-if [[ "${EXPLICIT_DEPLOY_DIR}" == "false" && -z "${DEPLOY_DIR}" && -n "${PROFILE_DEPLOY_DIR}" && "${TARGET_FORMAT}" != "nvidia" ]]; then
+if [[ "${EXPLICIT_DEPLOY_DIR}" == "false" && -z "${DEPLOY_DIR}" && -n "${PROFILE_DEPLOY_DIR}" && "${TARGET_FORMAT}" == "torq" ]]; then
     DEPLOY_DIR="${PROFILE_DEPLOY_DIR}"
 fi
 
@@ -377,6 +380,7 @@ RUN_NAME_STEM="$(basename "${RUN_NAME%.*}")"
 LABELS_FILE="${MODELS_LABELS_DIR}/${TARGET_FORMAT}_${BASE_MODEL_NAME}_${TIMESTAMP}.json"
 OUTPUT_VMFB="${MODELS_COMPILED_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}_${TIMESTAMP}.vmfb"
 OUTPUT_ONNX="${MODELS_COMPILED_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}_${TIMESTAMP}.onnx"
+OUTPUT_HEF="${MODELS_COMPILED_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}_${TIMESTAMP}.hef"
 
 # Resolve deployment overrides
 if [[ "${SKIP_DEPLOY}" == "true" ]]; then
@@ -394,6 +398,8 @@ else
 fi
 if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
     echo "  Target:        NVIDIA Video Card (ONNX -> ${OUTPUT_ONNX})"
+elif [[ "${TARGET_FORMAT}" == "hailo" ]]; then
+    echo "  Target:        Hailo-10H NPU (${HW_ARCH} HEF -> ${OUTPUT_HEF})"
 else
     echo "  Target:        Coralboard SL2619 Torq NPU (VMFB -> ${OUTPUT_VMFB})"
 fi
@@ -408,8 +414,17 @@ echo "==========================================================================
 # Tool Availability Verification
 # ------------------------------------------------------------------------------
 REQUIRED_TOOLS=(python3 yolo)
-if [[ "${SKIP_COMPILE}" == "false" && "${TARGET_FORMAT}" == "torq" ]]; then
-    REQUIRED_TOOLS+=(onnx2tf tosa-converter-for-tflite torq-compile)
+HAILO_VENV_PATH=""
+if [[ "${SKIP_COMPILE}" == "false" ]]; then
+    if [[ "${TARGET_FORMAT}" == "torq" ]]; then
+        REQUIRED_TOOLS+=(onnx2tf tosa-converter-for-tflite torq-compile)
+    elif [[ "${TARGET_FORMAT}" == "hailo" ]]; then
+        if [[ -x "./venv-hailo-310/bin/hailomz" ]]; then
+            HAILO_VENV_PATH="./venv-hailo-310"
+        else
+            REQUIRED_TOOLS+=(hailomz)
+        fi
+    fi
 fi
 
 for cmd in "${REQUIRED_TOOLS[@]}"; do
@@ -625,7 +640,7 @@ elif [[ "${RUNNER}" == "spark" ]]; then
                 data='datasets/data.yaml' \
                 model=\"\${START_MODEL}\" \
                 epochs=${EPOCHS} \
-                imgsz=320 \
+                imgsz=${IMGSZ} \
                 batch=${BATCH} \
                 workers=${WORKERS} \
                 cache=${CACHE} \
@@ -757,21 +772,34 @@ echo ""
 echo "=========================================================================="
 if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
     echo "  Step 3: NVIDIA GPU ONNX Export (${IMGSZ}x${IMGSZ})"
+elif [[ "${TARGET_FORMAT}" == "hailo" ]]; then
+    echo "  Step 3: Hailo-10H NPU Export, Calibration & HEF Compilation (${IMGSZ}x${IMGSZ})"
 else
     echo "  Step 3: Torq NPU Export, Quantization & Compilation (${IMGSZ}x${IMGSZ})"
 fi
 echo "=========================================================================="
 
+ONNX_OPSET=17
+[[ "${TARGET_FORMAT}" == "hailo" ]] && ONNX_OPSET=11
+
 EXPORTED_ONNX="${WEIGHTS_PATH%.pt}.onnx"
 if [[ ! -f "${EXPORTED_ONNX}" || "${WEIGHTS_PATH}" -nt "${EXPORTED_ONNX}" ]]; then
-    log_info "Exporting PyTorch model to ONNX (${IMGSZ}x${IMGSZ})..."
-    yolo export \
-        model="${WEIGHTS_PATH}" \
-        format=onnx \
-        imgsz="${IMGSZ}" \
-        dynamic=False \
-        simplify=True \
-        opset=17
+    log_info "Exporting PyTorch model to ONNX (${IMGSZ}x${IMGSZ}, opset=${ONNX_OPSET})..."
+    if [[ "${TARGET_FORMAT}" == "hailo" ]]; then
+        yolo export \
+            model="${WEIGHTS_PATH}" \
+            imgsz="${IMGSZ}" \
+            format=onnx \
+            opset="${ONNX_OPSET}"
+    else
+        yolo export \
+            model="${WEIGHTS_PATH}" \
+            format=onnx \
+            imgsz="${IMGSZ}" \
+            dynamic=False \
+            simplify=True \
+            opset="${ONNX_OPSET}"
+    fi
 fi
 
 if [[ ! -f "${EXPORTED_ONNX}" ]]; then
@@ -784,10 +812,83 @@ cp -f "${EXPORTED_ONNX}" "${OUTPUT_DIR}/best.onnx"
 if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
     mkdir -p "$(dirname "${OUTPUT_ONNX}")"
     cp -f "${EXPORTED_ONNX}" "${OUTPUT_ONNX}"
-    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}', target='${TARGET_FORMAT}')"
+    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}', target='${TARGET_FORMAT}', imgsz=${IMGSZ})"
     log_success "NVIDIA GPU ONNX model generated successfully: ${OUTPUT_ONNX} ($(du -h "${OUTPUT_ONNX}" | cut -f1))"
-    log_info "Target is NVIDIA GPU ('${TARGET_FORMAT}'): skipping Torq NPU INT8 quantization and .vmfb compilation."
+    log_info "Target is NVIDIA GPU ('${TARGET_FORMAT}'): skipping NPU quantization and compilation."
     PRIMARY_ARTIFACT="${OUTPUT_ONNX}"
+elif [[ "${TARGET_FORMAT}" == "hailo" ]]; then
+    log_info "Preparing calibration image directory and labels for Hailo Model Zoo (${HW_ARCH})..."
+    HAILO_CALIB_DIR="${OUTPUT_DIR}/hailo_calib_imgs"
+    python3 prepare_for_onnx2tf.py \
+        --skip-export \
+        --input-onnx "${OUTPUT_DIR}/best.onnx" \
+        --output-calib "${HAILO_CALIB_DIR}" \
+        --output-labels "${LABELS_FILE}" \
+        --data-yaml "${DATA_YAML}" \
+        --imgsz "${IMGSZ}" \
+        --base-model-name "${BASE_MODEL_NAME}" \
+        --target "${TARGET_FORMAT}"
+
+    NUM_CLASSES=$(python3 -c "import config_utils; print(len(config_utils.load_dataset_classes('${DATA_YAML}')))")
+    log_info "Compiling ONNX to Hailo HEF via hailomz in ${HAILO_VENV_PATH:-active environment} (arch=${HW_ARCH}, classes=${NUM_CLASSES})..."
+    (
+        HMZ_YAML_ARG=()
+        if [[ -n "${HAILO_VENV_PATH}" && -f "${HAILO_VENV_PATH}/bin/activate" ]]; then
+            HAILO_VENV_ABS="$(cd "${HAILO_VENV_PATH}" && pwd)"
+            mkdir -p "${HAILO_VENV_ABS}/etc/hailo"
+            touch "${HAILO_VENV_ABS}/etc/hailo/check_system_requirements_was_called"
+            LIBDEVICE_PATH=$(find "${HAILO_VENV_ABS}/lib" -maxdepth 6 -name "libdevice.10.bc" 2>/dev/null | head -n 1)
+            if [[ -n "${LIBDEVICE_PATH}" ]]; then
+                mkdir -p "${HAILO_VENV_ABS}/nvvm/libdevice"
+                ln -sfn "${LIBDEVICE_PATH}" "${HAILO_VENV_ABS}/nvvm/libdevice/libdevice.10.bc"
+                export XLA_FLAGS="--xla_gpu_cuda_data_dir=${HAILO_VENV_ABS}"
+            fi
+            export TF_FORCE_GPU_ALLOW_GROWTH=true
+            GPU_TOTAL_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ' ')
+            if [[ -n "${GPU_TOTAL_MB}" && "${GPU_TOTAL_MB}" -lt 6000 ]]; then
+                log_warn "GPU has ${GPU_TOTAL_MB} MiB VRAM (< 6000 MiB); running Hailo quantization/QFT on CPU to prevent OOM..."
+                export CUDA_VISIBLE_DEVICES=""
+            fi
+            HMZ_CFG_DIR=$(find "${HAILO_VENV_ABS}/lib" -maxdepth 3 -type d -path "*/hailo_model_zoo/cfg" 2>/dev/null | head -n 1)
+            if [[ -n "${HMZ_CFG_DIR}" && -d "${HMZ_CFG_DIR}/postprocess_config" && -d "${HMZ_CFG_DIR}/alls" ]]; then
+                ln -sfn "../postprocess_config" "${HMZ_CFG_DIR}/alls/postprocess_config"
+            fi
+            if [[ -n "${HMZ_CFG_DIR}" && -f "${HMZ_CFG_DIR}/networks/${RUN_NAME_STEM}.yaml" ]]; then
+                HMZ_YAML_ARG=(--yaml "${HMZ_CFG_DIR}/networks/${RUN_NAME_STEM}.yaml")
+            else
+                HMZ_YAML_ARG=("${RUN_NAME_STEM}")
+            fi
+            source "${HAILO_VENV_ABS}/bin/activate"
+        else
+            HMZ_YAML_ARG=("${RUN_NAME_STEM}")
+        fi
+        hailomz compile \
+            --ckpt "${OUTPUT_DIR}/best.onnx" \
+            --calib-path "${HAILO_CALIB_DIR}" \
+            "${HMZ_YAML_ARG[@]}" \
+            --end-node-names \
+                /model.22/cv2.0/cv2.0.2/Conv \
+                /model.22/cv3.0/cv3.0.2/Conv \
+                /model.22/cv2.1/cv2.1.2/Conv \
+                /model.22/cv3.1/cv3.1.2/Conv \
+                /model.22/cv2.2/cv2.2.2/Conv \
+                /model.22/cv3.2/cv3.2.2/Conv \
+            --classes "${NUM_CLASSES}" \
+            --hw-arch "${HW_ARCH}"
+    )
+
+    GENERATED_HEF="${RUN_NAME_STEM}.hef"
+    if [[ ! -f "${GENERATED_HEF}" && -f "${OUTPUT_DIR}/${RUN_NAME_STEM}.hef" ]]; then
+        GENERATED_HEF="${OUTPUT_DIR}/${RUN_NAME_STEM}.hef"
+    fi
+    if [[ ! -f "${GENERATED_HEF}" ]]; then
+        log_err "hailomz compile failed to produce HEF binary '${RUN_NAME_STEM}.hef'"
+        exit 1
+    fi
+    mkdir -p "$(dirname "${OUTPUT_HEF}")"
+    mv -f "${GENERATED_HEF}" "${OUTPUT_HEF}"
+    log_success "Hailo HEF generated successfully: ${OUTPUT_HEF} ($(du -h "${OUTPUT_HEF}" | cut -f1))"
+    PRIMARY_ARTIFACT="${OUTPUT_HEF}"
 else
     log_info "Normalizing ONNX coordinates and generating calibration dataset..."
     python3 prepare_for_onnx2tf.py \
@@ -923,6 +1024,12 @@ if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
     echo "=========================================================================="
     echo "Artifacts Generated:"
     echo "  1. ONNX Model      : ${OUTPUT_ONNX} ($(du -h "${OUTPUT_ONNX}" | cut -f1))"
+    echo "     Soft Link       : ${MODEL_SYMLINK}"
+elif [[ "${TARGET_FORMAT}" == "hailo" ]]; then
+    echo -e "${GREEN}  PIPELINE COMPLETE - HEF MODEL READY FOR HAILO-10H NPU INFERENCE!${NC}"
+    echo "=========================================================================="
+    echo "Artifacts Generated:"
+    echo "  1. Hailo HEF Binary: ${OUTPUT_HEF} ($(du -h "${OUTPUT_HEF}" | cut -f1))"
     echo "     Soft Link       : ${MODEL_SYMLINK}"
 else
     echo -e "${GREEN}  PIPELINE COMPLETE - MODEL READY FOR NPU INFERENCE!${NC}"

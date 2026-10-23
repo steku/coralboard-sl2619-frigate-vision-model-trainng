@@ -119,6 +119,26 @@ def test_get_profile_resolution():
     assert p_spark_nvidia["epochs"] == 100
     assert p_spark_nvidia["patience"] == 30
 
+    # Test hailo and spark-hailo profiles
+    p_hailo = config_utils.get_profile("hailo")
+    assert p_hailo["name"] == "hailo"
+    assert p_hailo["remote"] is False
+    assert p_hailo["target"] == "hailo"
+    assert p_hailo["hw_arch"] == "hailo10h"
+    assert p_hailo["base_model"] == "yolov8m.pt"
+    assert p_hailo["imgsz"] == 640
+    assert p_hailo["batch"] == 16
+
+    p_spark_hailo = config_utils.get_profile("spark-hailo")
+    assert p_spark_hailo["name"] == "spark-hailo"
+    assert p_spark_hailo["remote"] is True
+    assert p_spark_hailo["target"] == "hailo"
+    assert p_spark_hailo["hw_arch"] == "hailo10h"
+    assert p_spark_hailo["base_model"] == "yolov8m.pt"
+    assert p_spark_hailo["imgsz"] == 640
+    assert p_spark_hailo["batch"] == 16
+    assert p_spark_hailo["epochs"] == 100
+
     # Unknown profile (including 'nvidia-spark') raises ValueError
     with pytest.raises(ValueError, match="Unknown profile"):
         config_utils.get_profile("nvidia-spark")

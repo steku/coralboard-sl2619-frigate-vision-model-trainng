@@ -57,6 +57,8 @@ wheels/
 *.hdf5
 *.fb
 *.flatbuffer
+packages/*.whl
+packages/*.deb
 
 # NPU / Hardware compiled models (Torq / Coral / Hailo / TensorRT)
 *.vmfb
