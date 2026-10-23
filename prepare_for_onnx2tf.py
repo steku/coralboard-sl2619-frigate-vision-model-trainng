@@ -21,26 +21,11 @@ import onnx
 from onnx import helper, TensorProto, numpy_helper
 import yaml
 
+import config_utils
+
 
 def load_dataset_metadata(data_yaml_path: str = "datasets/data.yaml"):
-    path = Path(data_yaml_path)
-    if not path.exists() and data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
-        for cand in ("datasets/data.yaml", "datasets/yolo/data.yaml", "yolo_dataset/data.yaml"):
-            if Path(cand).exists():
-                path = Path(cand)
-                break
-    if not path.exists():
-        raise FileNotFoundError(f"Dataset config not found at {data_yaml_path}")
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    names = data.get("names", {})
-    if isinstance(names, list):
-        names = {i: name for i, name in enumerate(names)}
-    elif isinstance(names, dict):
-        names = {int(k): str(v) for k, v in names.items()}
-    else:
-        raise ValueError(f"Invalid format for 'names' in {data_yaml_path}")
-    return names
+    return config_utils.load_dataset_classes(data_yaml_path)
 
 
 def step1_export_onnx(model_pt: str, onnx_out: str, size: int = 320):
@@ -442,39 +427,18 @@ def step4_generate_labels_json(
 
     # Create soft links without datetime
     labels_dir = labels_path.parent
-    clean_json = labels_dir / f"{target}_{resolved_base}.json"
-    clean_txt = labels_dir / f"{target}_{resolved_base}.txt"
-    if clean_json != labels_path:
-        if clean_json.is_symlink() or clean_json.exists():
-            clean_json.unlink()
-        try:
-            clean_json.symlink_to(labels_path.name)
-        except OSError:
-            pass
+    _update_symlink(labels_dir / f"{target}_{resolved_base}.json", labels_path)
+    _update_symlink(labels_dir / f"{target}_{resolved_base}.txt", txt_out)
+    _update_symlink(labels_dir / "labels.json", labels_path)
+    _update_symlink(labels_dir / "labels.txt", txt_out)
 
-    if clean_txt != txt_out:
-        if clean_txt.is_symlink() or clean_txt.exists():
-            clean_txt.unlink()
-        try:
-            clean_txt.symlink_to(txt_out.name)
-        except OSError:
-            pass
 
-    default_json = labels_dir / "labels.json"
-    if default_json != labels_path:
-        if default_json.is_symlink() or default_json.exists():
-            default_json.unlink()
+def _update_symlink(link_path: Path, target_path: Path) -> None:
+    if link_path != target_path:
+        if link_path.is_symlink() or link_path.exists():
+            link_path.unlink()
         try:
-            default_json.symlink_to(labels_path.name)
-        except OSError:
-            pass
-
-    default_txt = labels_dir / "labels.txt"
-    if default_txt != txt_out:
-        if default_txt.is_symlink() or default_txt.exists():
-            default_txt.unlink()
-        try:
-            default_txt.symlink_to(txt_out.name)
+            link_path.symlink_to(target_path.name)
         except OSError:
             pass
 

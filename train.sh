@@ -144,7 +144,7 @@ usage() {
     echo "quantizes to INT8, compiles to Torq NPU binary, and deploys if configured."
     echo ""
     echo "Execution Profiles:"
-    echo "  -p, --profile NAME      Select profile from config.yaml (e.g. 'torq', 'spark-torq', 'spark-torq-yolo26n', 'nvidia', 'spark-nvidia', 'hailo', 'spark-hailo', 'cpu-torq')"
+    echo "  -p, --profile NAME      Select profile from config.yaml (e.g. 'torq', 'torq-spark', 'torq-spark-yolo26n', 'nvidia', 'nvidia-spark', 'hailo', 'hailo-spark', 'cpu-torq')"
     echo ""
     echo "Primary Workflows:"
     echo "  --compile [MODEL.pt]    Skip training; compile checkpoint directly (or latest best.pt)"

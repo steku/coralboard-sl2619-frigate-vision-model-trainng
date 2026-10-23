@@ -42,6 +42,13 @@ def folder_cvat_module():
     return load_module_from_path("folder_to_cvat", path)
 
 
+@pytest.fixture(scope="session")
+def report_balance_module():
+    """Import and return the report-cvat-balance module."""
+    path = REPO_ROOT / "report-cvat-balance.py"
+    return load_module_from_path("report_cvat_balance", path)
+
+
 @pytest.fixture
 def sample_accuracy_report():
     """Return a mock dictionary mirroring test_server_accuracy.py benchmark output."""

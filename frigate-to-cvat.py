@@ -249,11 +249,7 @@ def fetch_cvat_object_counts(cvat_url, cvat_user, cvat_pass, timeout=10):
 
             r_ann = session.get(f"{base_url}/api/tasks/{tid}/annotations", timeout=timeout)
             if r_ann.status_code == 200:
-                ann = r_ann.json()
-                for item in ann.get("shapes", []) + ann.get("tracks", []) + ann.get("tags", []):
-                    lid = item.get("label_id")
-                    name = id_to_name.get(lid, f"label_{lid}")
-                    counts[name] += 1
+                counts.update(config_utils.count_cvat_annotations(r_ann.json(), id_to_name))
         except Exception as e:
             print(f"[WARN] Failed fetching annotations for CVAT task {tid}: {e}")
 
@@ -766,6 +762,53 @@ def parse_args():
     return args
 
 
+def _harvest_with_surplus_rollover(
+    sorted_labels,
+    quotas,
+    deficits,
+    frigate_url,
+    camera,
+    processed_ids,
+    seen_event_ids,
+    timeout,
+):
+    """Harvest events from Frigate per label in priority order, rolling over unused quota to remaining deficit classes."""
+    label_events = {}
+    surplus = 0
+    for idx, lbl in enumerate(sorted_labels):
+        rem_labels = sorted_labels[idx:]
+        if surplus > 0 and len(rem_labels) > 0:
+            rem_def_sum = sum(deficits[rl] for rl in rem_labels)
+            if rem_def_sum > 0:
+                share = round(surplus * (deficits[lbl] / rem_def_sum))
+                quotas[lbl] += share
+                surplus -= share
+
+        req_count = quotas[lbl]
+        lbl_evs = fetch_events_from_frigate(
+            frigate_url=frigate_url,
+            target_labels=[lbl],
+            target_count=req_count,
+            camera=camera,
+            processed_ids=processed_ids.union(seen_event_ids),
+            timeout=timeout,
+        )
+        label_events[lbl] = lbl_evs
+        for ev in lbl_evs:
+            eid = ev.get("id")
+            if eid:
+                seen_event_ids.add(eid)
+
+        got = len(lbl_evs)
+        if got < req_count:
+            unused = req_count - got
+            surplus += unused
+            print(f"  - [{lbl}]: retrieved {got}/{req_count} new/unprocessed events ({unused} unused quota rolled over to remaining deficit classes).")
+        else:
+            print(f"  - [{lbl}]: retrieved {got}/{req_count} new/unprocessed events from Frigate.")
+    return label_events
+
+
 def harvest_from_frigate(
     frigate_url,
     output_dir,
@@ -883,39 +926,16 @@ def harvest_from_frigate(
                     st = health_status.get(lbl, "GOOD")
                     print(f"  - [{lbl:<8}]: quota = {quotas[lbl]:>3}  (accuracy: {sc:>5.1f}%, health: {st})")
 
-                # Harvest from Frigate prioritized by lowest score first
-                surplus = 0
-                for idx, lbl in enumerate(sorted_labels):
-                    rem_labels = sorted_labels[idx:]
-                    if surplus > 0 and len(rem_labels) > 0:
-                        rem_def_sum = sum(deficits[rl] for rl in rem_labels)
-                        if rem_def_sum > 0:
-                            share = round(surplus * (deficits[lbl] / rem_def_sum))
-                            quotas[lbl] += share
-                            surplus -= share
-
-                    req_count = quotas[lbl]
-                    lbl_evs = fetch_events_from_frigate(
-                        frigate_url=frigate_url,
-                        target_labels=[lbl],
-                        target_count=req_count,
-                        camera=camera,
-                        processed_ids=processed_ids.union(seen_event_ids),
-                        timeout=timeout,
-                    )
-                    label_events[lbl] = lbl_evs
-                    for ev in lbl_evs:
-                        eid = ev.get("id")
-                        if eid:
-                            seen_event_ids.add(eid)
-
-                    got = len(lbl_evs)
-                    if got < req_count:
-                        unused = req_count - got
-                        surplus += unused
-                        print(f"  - [{lbl}]: retrieved {got}/{req_count} new/unprocessed events ({unused} unused quota rolled over to remaining deficit classes).")
-                    else:
-                        print(f"  - [{lbl}]: retrieved {got}/{req_count} new/unprocessed events from Frigate.")
+                label_events = _harvest_with_surplus_rollover(
+                    sorted_labels=sorted_labels,
+                    quotas=quotas,
+                    deficits=deficits,
+                    frigate_url=frigate_url,
+                    camera=camera,
+                    processed_ids=processed_ids,
+                    seen_event_ids=seen_event_ids,
+                    timeout=timeout,
+                )
             else:
                 print("[WARN] No valid tested classes with score > 0 found in accuracy report. Falling back to equal distribution.")
 
@@ -934,39 +954,16 @@ def harvest_from_frigate(
                 print(f"  - [{lbl:<8}]: quota = {quotas[lbl]:>3}  (CVAT existing: {cnt:>4}, health: {status})")
 
             # Harvest from Frigate prioritized by lowest CVAT count first
-            surplus = 0
-            for idx, lbl in enumerate(sorted_labels):
-                rem_labels = sorted_labels[idx:]
-                # Dynamically distribute accumulated surplus among remaining labels based on deficit
-                if surplus > 0 and len(rem_labels) > 0:
-                    rem_def_sum = sum(deficits[rl] for rl in rem_labels)
-                    if rem_def_sum > 0:
-                        share = round(surplus * (deficits[lbl] / rem_def_sum))
-                        quotas[lbl] += share
-                        surplus -= share
-
-                req_count = quotas[lbl]
-                lbl_evs = fetch_events_from_frigate(
-                    frigate_url=frigate_url,
-                    target_labels=[lbl],
-                    target_count=req_count,
-                    camera=camera,
-                    processed_ids=processed_ids.union(seen_event_ids),
-                    timeout=timeout,
-                )
-                label_events[lbl] = lbl_evs
-                for ev in lbl_evs:
-                    eid = ev.get("id")
-                    if eid:
-                        seen_event_ids.add(eid)
-
-                got = len(lbl_evs)
-                if got < req_count:
-                    unused = req_count - got
-                    surplus += unused
-                    print(f"  - [{lbl}]: retrieved {got}/{req_count} new/unprocessed events ({unused} unused quota rolled over to remaining deficit classes).")
-                else:
-                    print(f"  - [{lbl}]: retrieved {got}/{req_count} new/unprocessed events from Frigate.")
+            label_events = _harvest_with_surplus_rollover(
+                sorted_labels=sorted_labels,
+                quotas=quotas,
+                deficits=deficits,
+                frigate_url=frigate_url,
+                camera=camera,
+                processed_ids=processed_ids,
+                seen_event_ids=seen_event_ids,
+                timeout=timeout,
+            )
 
         else:
             quota = max(1, limit // max(1, len(target_labels)))
@@ -1227,19 +1224,7 @@ def upload_to_cvat(cvat_url, cvat_user, cvat_pass, output_dir, task_name=None, c
             task_url = f"{cvat_base}/tasks/{task.id}"
 
             # Save state to .last_cvat_task for automated pipeline pickup
-            state_data = {
-                "task_id": task.id,
-                "task_name": task.name,
-                "cvat_url": cvat_url,
-                "task_url": task_url,
-                "created_at": datetime.datetime.now().isoformat(),
-            }
-            state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_cvat_task")
-            try:
-                with open(state_path, "w", encoding="utf-8") as f:
-                    json.dump(state_data, f, indent=2)
-            except Exception:
-                pass
+            config_utils.save_cvat_task_state(task.id, task.name, cvat_url, task_url)
 
             print("\n" + "=" * 70)
             print(" [SUCCESS] CVAT Task Successfully Created!")

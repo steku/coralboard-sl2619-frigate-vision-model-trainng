@@ -47,3 +47,76 @@ def test_resolve_execution_device():
 
     dev_onnx = test_nvidia_accuracy.resolve_execution_device("model.onnx", "cpu")
     assert dev_onnx == "cpu"
+
+
+def test_nvidia_evaluate_pipeline_mock(tmp_path, monkeypatch):
+    import argparse
+    import json
+    from PIL import Image
+    import torch
+
+    dataset_dir = tmp_path / "dataset"
+    img_dir = dataset_dir / "images" / "val"
+    lbl_dir = dataset_dir / "labels" / "val"
+    img_dir.mkdir(parents=True)
+    lbl_dir.mkdir(parents=True)
+
+    Image.new("RGB", (100, 100), color="red").save(img_dir / "img01.jpg")
+    (lbl_dir / "img01.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+    (dataset_dir / "data.yaml").write_text("names:\n  0: person\n")
+
+    fake_model = tmp_path / "fake.onnx"
+    fake_model.write_text("onnx")
+
+    class DummyBoxes:
+        def __init__(self):
+            self.cls = torch.tensor([0.0])
+            self.conf = torch.tensor([0.92])
+            self.xyxy = torch.tensor([[40.0, 40.0, 60.0, 60.0]])
+
+        def __len__(self):
+            return 1
+
+    class DummyResult:
+        def __init__(self):
+            self.boxes = DummyBoxes()
+            self.speed = {"inference": 4.5}
+
+    class DummyYOLO:
+        def __init__(self, path):
+            self.path = path
+
+        def __call__(self, *args, **kwargs):
+            return [DummyResult()]
+
+    monkeypatch.setattr(test_nvidia_accuracy, "YOLO", DummyYOLO)
+
+    out_json = tmp_path / "nvidia_report.json"
+    args = argparse.Namespace(
+        model=str(fake_model),
+        dataset_dir=str(dataset_dir),
+        labels_path=None,
+        num_images=1,
+        coco_images=0,
+        coco_dataset="coco128",
+        frigate_plus_images=0,
+        frigate_plus_dir=str(tmp_path / "fp"),
+        datasets_dir=str(tmp_path),
+        split="val",
+        all=False,
+        device="cpu",
+        imgsz=320,
+        threshold=0.20,
+        iou_threshold=0.45,
+        seed=42,
+        output_json=str(out_json),
+        verbose=True,
+    )
+
+    test_nvidia_accuracy.evaluate(args)
+    assert out_json.is_file()
+    report = json.loads(out_json.read_text(encoding="utf-8"))
+    assert report["summary"]["true_positives"] == 1
+    assert report["summary"]["precision"] == 100.0
+    assert report["summary"]["recall"] == 100.0
+

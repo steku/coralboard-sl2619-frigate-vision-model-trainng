@@ -64,6 +64,8 @@ packages/*.deb
 *.vmfb
 *.synap
 *.hef
+*.har
+*.alls
 *.engine
 *.trt
 

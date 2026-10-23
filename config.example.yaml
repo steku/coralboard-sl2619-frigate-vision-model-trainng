@@ -174,7 +174,7 @@ profiles:
     warmup_bias_lr: 0.0
 
   # Remote NVIDIA DGX / Spark server training via SSH for Torq NPU
-  spark-torq:
+  torq-spark:
     target: "torq"
     remote: true
     host: "user@dgx-spark.local" # Replace with your user@hostname
@@ -196,7 +196,7 @@ profiles:
     clean_images: false
 
   # Remote Spark server training using yolo26n architecture for Torq NPU
-  spark-torq-yolo26n:
+  torq-spark-yolo26n:
     target: "torq"
     remote: true
     host: "user@dgx-spark.local"
@@ -239,7 +239,7 @@ profiles:
     warmup_bias_lr: 0.0
 
   # Remote Spark server training with NVIDIA Video Card ONNX output (yolov9s.pt)
-  spark-nvidia:
+  nvidia-spark:
     target: "nvidia"
     remote: true
     host: "user@dgx-spark.local"
@@ -282,7 +282,7 @@ profiles:
     warmup_bias_lr: 0.0
 
   # Remote Spark server training & compilation for Hailo-10H NPU (yolov8m.pt, 640x640, .hef output)
-  spark-hailo:
+  hailo-spark:
     target: "hailo"
     hw_arch: "hailo10h"
     remote: true

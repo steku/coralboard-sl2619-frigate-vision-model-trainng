@@ -263,16 +263,12 @@ def export_and_prepare_yolo(
             train_list.append(str(Path(coco_info["train_dir"]).resolve()))
             val_list.append(str(Path(coco_info["val_dir"]).resolve()))
 
-        yaml_content = "train:\n"
-        for p in train_list:
-            yaml_content += f"  - {p}\n"
-        yaml_content += "val:\n"
-        for p in val_list:
-            yaml_content += f"  - {p}\n"
-        yaml_content += "\nnames:\n"
-
-        for idx in sorted(final_names.keys()):
-            yaml_content += f"  {idx}: {final_names[idx]}\n"
+        yaml_data = {
+            "train": train_list,
+            "val": val_list,
+            "names": {idx: final_names[idx] for idx in sorted(final_names.keys())},
+        }
+        yaml_content = yaml.safe_dump(yaml_data, sort_keys=False)
 
         yaml_path = out_path / "data.yaml"
         with open(yaml_path, "w", encoding="utf-8") as f:

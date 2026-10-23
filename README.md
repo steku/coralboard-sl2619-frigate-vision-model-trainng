@@ -1,6 +1,9 @@
-# Frigate Model Training & Coralboard SL2619 Torq NPU Pipeline
+# Frigate Model Training & Multi-Target Hardware Acceleration Pipeline
 
-End-to-end pipeline to harvest detection events from **Frigate NVR**, annotate and review them in **[CVAT (Computer Vision Annotation Tool)](https://github.com/cvat-ai/cvat)**, export the dataset to **YOLO format**, train a **YOLOv8n ($320 \times 320$)** or **YOLO26n** model, and compile it for real-time hardware acceleration on the **Synaptics Coralboard SL2619 Torq NPU** running [`coralboard-sl2619-vision`](https://github.com/steku/coralboard-sl2619-vision.git).
+End-to-end pipeline to harvest detection events from **Frigate NVR**, annotate and review them in **[CVAT (Computer Vision Annotation Tool)](https://github.com/cvat-ai/cvat)**, export the dataset to **YOLO format**, fine-tune **YOLOv8n / YOLO26n / YOLOv9s ($320 \times 320$)** or **YOLOv8m ($640 \times 640$)** models, and compile them for real-time hardware acceleration on:
+- **Synaptics Coralboard SL2619 Torq NPU** (`.vmfb`, INT8, $320 \times 320$) running [`coralboard-sl2619-vision`](https://github.com/steku/coralboard-sl2619-vision.git)
+- **NVIDIA GPU / TensorRT** (`.onnx`, FP32/FP16, $320 \times 320$)
+- **Hailo-10H NPU** (`.hef`, INT8, $640 \times 640$)
 
 Validated against official Synaptics documentation:
 - [Deploy a Custom YOLO Model on the Synaptics Torq NPU](https://developer.synaptics.com/blog/custom-yolo-to-torq)
@@ -93,12 +96,24 @@ tosa-converter-for-tflite --version || tosa-converter-for-tflite -h
 torq-compile --version
 ```
 
-### 4. Run the Automated Test Suite
+### 4. Optional: Hailo-10H Python 3.10 Environment (`./venv-hailo-310`)
 
-Run the unit test suite to verify configuration parsers, deficit balancing algorithms, server accuracy calculation, and dataset conversions:
+When targeting **Hailo-10H** (`-p hailo` or `-p hailo-spark`), the Hailo Dataflow Compiler (`hailo_dataflow_compiler` v5.3.0) and Hailo Model Zoo (`hailo_model_zoo` v2.19.0) run in a dedicated **Python 3.10** virtual environment (`./venv-hailo-310`):
 
 ```bash
-pytest
+python3.10 -m venv venv-hailo-310
+./venv-hailo-310/bin/pip install --upgrade pip
+./venv-hailo-310/bin/pip install packages/hailo_dataflow_compiler-5.3.0-cp310-cp310-linux_x86_64.whl packages/hailo_model_zoo-2.19.0-py3-none-any.whl
+```
+
+`train.sh` automatically invokes `./venv-hailo-310/bin/hailomz` during postprocessing and checks available local GPU VRAM before quantization—automatically falling back to CPU (`CUDA_VISIBLE_DEVICES=""`) if free GPU memory is below 6000 MiB.
+
+### 5. Run the Automated Test Suite
+
+Run the unit test suite to verify configuration parsers, deficit balancing algorithms, server accuracy calculation, ONNX/calibration preparation, and dataset conversions:
+
+```bash
+./venv-torq-312/bin/pytest
 ```
 
 ---
@@ -185,7 +200,7 @@ profiles:
     warmup_momentum: 0.5
     warmup_bias_lr: 0.0
 
-  spark-torq:                   # Remote NVIDIA DGX / Spark server training via SSH for Torq NPU
+  torq-spark:                   # Remote NVIDIA DGX / Spark server training via SSH for Torq NPU
     target: "torq"
     remote: true
     host: "user@dgx-spark.local"
@@ -206,7 +221,7 @@ profiles:
     warmup_bias_lr: 0.0
     clean_images: false
 
-  spark-torq-yolo26n:           # Remote Spark server training using yolo26n architecture for Torq NPU
+  torq-spark-yolo26n:           # Remote Spark server training using yolo26n architecture for Torq NPU
     target: "torq"
     remote: true
     host: "user@dgx-spark.local"
@@ -263,18 +278,61 @@ profiles:
     warmup_momentum: 0.5
     warmup_bias_lr: 0.0
 
-  spark-nvidia:                 # Remote Spark GPU training & ONNX export for NVIDIA GPU deployment
+  nvidia-spark:                 # Remote Spark GPU training & ONNX export for NVIDIA GPU deployment
     remote: true
     target: "nvidia"
     host: "user@dgx-spark.local"
     remote_dir: "~/frigate-model-training"
     device: "0"
-    batch: 64
+    batch: 16
     workers: 8
     cache: "ram"
-    epochs: 300
-    patience: 50
+    epochs: 100
+    patience: 30
     base_model: "yolov9s.pt"
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
+    clean_images: false
+
+  hailo:                        # Local GPU training & Hailo-10H (.hef) compilation (640x640)
+    remote: false
+    target: "hailo"
+    hw_arch: "hailo10h"
+    device: "0"
+    batch: 16
+    workers: 8
+    cache: "ram"
+    epochs: 80
+    patience: 20
+    base_model: "yolov8m.pt"
+    imgsz: 640
+    optimizer: "AdamW"
+    lr0: 0.0005
+    lrf: 0.01
+    cos_lr: true
+    warmup_epochs: 5.0
+    warmup_momentum: 0.5
+    warmup_bias_lr: 0.0
+
+  hailo-spark:                  # Remote Spark GPU training & local Hailo-10H (.hef) compilation (640x640)
+    remote: true
+    target: "hailo"
+    hw_arch: "hailo10h"
+    host: "user@dgx-spark.local"
+    remote_dir: "~/frigate-model-training"
+    device: "0"
+    batch: 16
+    workers: 8
+    cache: "ram"
+    epochs: 100
+    patience: 30
+    base_model: "yolov8m.pt"
+    imgsz: 640
     optimizer: "AdamW"
     lr0: 0.0005
     lrf: 0.01
@@ -504,10 +562,10 @@ python report-cvat-balance.py --json
 ./train.sh --export
 
 # 2. Turnkey run on remote Spark GPU server for Torq NPU, exporting ALL CVAT tasks:
-./train.sh -p spark-torq --export all
+./train.sh -p torq-spark --export all
 
 # 3. Train using YOLO26n architecture on Spark for Torq NPU:
-./train.sh -p spark-torq-yolo26n --export all
+./train.sh -p torq-spark-yolo26n --export all
 
 # 4. Train with explicit local GPU device and custom epochs:
 ./train.sh --device 0 --epochs 100 --batch 16
@@ -522,10 +580,10 @@ python report-cvat-balance.py --json
 ./train.sh --resume
 
 # 8. Train remotely on Spark only, pull weights, but skip local compilation:
-./train.sh -p spark-torq --skip-compile
+./train.sh -p torq-spark --skip-compile
 
 # 9. Pull latest trained weights from Spark and compile locally (skip training):
-./train.sh -p spark-torq --pull
+./train.sh -p torq-spark --pull
 
 # 10. Fast compilation of an existing checkpoint (skip training):
 ./train.sh --compile runs/detect/frigate_coral/yolov8n/weights/best.pt
@@ -533,28 +591,54 @@ python report-cvat-balance.py --json
 # 11. Wipe and replace datasets/yolo instead of appending:
 ./train.sh --export all --replace
 
-# 12. Auto-clean remote training images on Spark after run completes:
-./train.sh -p spark-torq --clean-images
-
-# 13. Train YOLOv9s and export ONNX for NVIDIA GPU (exits early before Torq .vmfb compilation):
+# 12. Train YOLOv9s and export ONNX for NVIDIA GPU (exits early before Torq .vmfb compilation):
 ./train.sh -p nvidia
 
-# 14. Train YOLOv9s remotely on Spark and export ONNX locally for NVIDIA GPU:
-./train.sh -p spark-nvidia
+# 13. Train YOLOv9s remotely on Spark and export ONNX locally for NVIDIA GPU:
+./train.sh -p nvidia-spark
 
-# 15. Compile an existing checkpoint to ONNX only for NVIDIA GPU:
+# 14. Compile an existing checkpoint to ONNX only for NVIDIA GPU:
 ./train.sh -p nvidia --compile runs/detect/frigate_coral/yolov9s/weights/best.pt
+
+# 15. Train YOLOv8m (640x640) on Spark and compile to Hailo-10H (.hef):
+./train.sh -p hailo-spark
+
+# 16. Compile an existing YOLOv8m checkpoint directly to Hailo-10H (.hef):
+./train.sh -p hailo --compile runs/detect/frigate_coral/yolov8m/weights/best.pt
 ```
 
-#### Architecture Comparison: YOLOv8n vs. YOLO26n
+#### Artifact Naming, Soft Links & Pipeline Timing Report
 
-| Feature | YOLOv8n (`yolov8n.pt`) | YOLO26n (`yolo26n.pt`) |
-| :--- | :--- | :--- |
-| **Recommended Profile** | `torq` / `spark-torq` (Default) | `spark-torq-yolo26n` |
-| **Loss & Supervision** | Multi-anchor `TaskAlignedAssigner` + DFL | Single-anchor `end2end` scalar regression |
-| **Small-Dataset Convergence** | Fast (~80 epochs, 84.6% mAP@50) | Requires 200–300 epochs (`patience: 50`) |
-| **INT8 Output Scale** | Fine (`scale = 0.00616`), tight confidences | Coarser (`scale = 0.01012`), requires lower detection threshold (~0.15) |
-| **Compiled Binary** | `custom_yolov8n.vmfb` (~3.4 MB, ~13 ms) | `custom_yolo26n.vmfb` (~3.5 MB, ~14 ms) |
+Every compilation run generates timestamped artifacts (`<target>_<model>_<YYMMDD-HHMM>.<ext>`) and automatically updates non-timestamped convenience soft links:
+
+- **Compiled Models (`models/compiled/`)**:
+  - Torq NPU: `torq_yolov8n_<YYMMDD-HHMM>.vmfb` $\rightarrow$ symlinked as `torq_yolov8n.vmfb`
+  - NVIDIA GPU: `nvidia_yolov9s_<YYMMDD-HHMM>.onnx` $\rightarrow$ symlinked as `nvidia_yolov9s.onnx`
+  - Hailo-10H NPU: `hailo_yolov8m_<YYMMDD-HHMM>.hef` $\rightarrow$ symlinked as `hailo_yolov8m.hef`
+- **Label Maps (`models/labels/`)**:
+  - `<target>_<model>_<YYMMDD-HHMM>.{json,txt}` $\rightarrow$ symlinked as `<target>_<model>.{json,txt}` and `labels.{json,txt}`
+
+At the completion of `train.sh`, a **Pipeline Timing Summary** report is printed:
+```text
+==========================================================================
+  PIPELINE TIMING SUMMARY
+==========================================================================
+  Preprocessing  : 0m 12s  (Config, dataset prep & pre-training sync)
+  Training       : 14m 28s  (YOLO model training execution)
+  Postprocessing : 3m 45s  (Export, quantization, compilation & deploy)
+--------------------------------------------------------------------------
+  Total Time     : 18m 25s
+==========================================================================
+```
+
+#### Architecture Comparison: YOLOv8n vs. YOLO26n vs. YOLOv8m (Hailo-10H)
+
+| Feature | YOLOv8n (`yolov8n.pt`) | YOLO26n (`yolo26n.pt`) | YOLOv8m (`yolov8m.pt`) |
+| :--- | :--- | :--- | :--- |
+| **Recommended Profile** | `torq` / `torq-spark` (Default) | `torq-spark-yolo26n` | `hailo` / `hailo-spark` |
+| **Input Resolution** | $320 \times 320$ | $320 \times 320$ | $640 \times 640$ |
+| **Loss & Supervision** | Multi-anchor `TaskAlignedAssigner` + DFL | Single-anchor `end2end` scalar regression | Multi-anchor `TaskAlignedAssigner` + DFL |
+| **Compiled Binary** | `torq_yolov8n.vmfb` (~3.4 MB, ~13 ms) | `torq_yolo26n.vmfb` (~3.5 MB, ~14 ms) | `hailo_yolov8m.hef` (Hailo-10H NPU) |
 
 ---
 
@@ -611,7 +695,7 @@ The Torq NPU binary outputs raw integer indices ($0 \dots C-1$). If `labels_<nam
 
 ### Step 5: Deployment to Frigate NVR (NVIDIA GPU / TensorRT)
 
-When using the `nvidia` or `spark-nvidia` training profiles, the pipeline exports a full-precision ONNX model (e.g. `models/compiled/custom_yolov9s.onnx` or `custom_yolov8n.onnx`) directly optimized for NVIDIA GPUs running TensorRT inside Frigate.
+When using the `nvidia` or `nvidia-spark` training profiles, the pipeline exports a full-precision ONNX model (e.g. `models/compiled/nvidia_yolov9s_<timestamp>.onnx` with symlink `models/compiled/nvidia_yolov9s.onnx`) directly optimized for NVIDIA GPUs running TensorRT inside Frigate.
 
 #### 1. Frigate `config.yml` Detector & Model Configuration
 
@@ -622,13 +706,13 @@ detectors:
     device: 0                         # NVIDIA GPU index (0 for first GPU)
 
 model:
-  path: /config/models/custom_yolov9s.onnx  # Path to the .onnx model mounted in Frigate
+  path: /config/models/nvidia_yolov9s.onnx  # Path to the .onnx model mounted in Frigate
   width: 320                         # Matches training imgsz (320)
   height: 320                        # Matches training imgsz (320)
   input_tensor: nchw                 # Ultralytics ONNX layout: [1, 3, 320, 320]
   input_pixel_format: rgb            # Standard float32 RGB inputs normalized to [0.0, 1.0]
   model_type: yolov8                 # Parses Ultralytics detection head (see note below)
-  labelmap_path: /config/models/labels.txt  # Plain-text label mapping (e.g. labels_yolov9s.txt or labels.txt)
+  labelmap_path: /config/models/labels.txt  # Plain-text label mapping (e.g. nvidia_yolov9s.txt or labels.txt)
 
 objects:
   track:
@@ -664,7 +748,7 @@ Mount the directory holding the compiled ONNX model and `labels.txt` into the Fr
 docker run -d \
   --name frigate \
   --gpus all \
-  -v /home/steve/Projects/frigate-model-training/models/compiled:/config/models:ro \
+  -v /path/to/frigate-model-training/models/compiled:/config/models:ro \
   ...
 ```
 
@@ -799,7 +883,7 @@ objects:
 [`test_nvidia_accuracy.py`](test_nvidia_accuracy.py) benchmarks local or remote NVIDIA models (`.onnx` or `.pt`) directly on CUDA GPU or CPU, reporting per-class Precision, Recall, F1-Score, mIoU, and execution latency. It mirrors the exact command-line interface and dataset options of `test_server_accuracy.py`.
 
 ```bash
-# 1. Benchmark default compiled NVIDIA model (custom_yolov9s.onnx) on 60 random dataset images:
+# 1. Benchmark default compiled NVIDIA model (nvidia_yolov9s.onnx) on 60 random dataset images:
 python test_nvidia_accuracy.py
 
 # 2. Benchmark on CUDA GPU with specific confidence threshold:
@@ -861,11 +945,11 @@ python export-cvat-to-yolo.py --export all --replace
 | [`frigate-to-cvat.py`](frigate-to-cvat.py) | **Frigate Harvest & CVAT Upload**: Downloads events from Frigate, creates COCO pre-annotations, and uploads review tasks to CVAT with dynamic deficit balancing. |
 | [`folder-to-cvat.py`](folder-to-cvat.py) | **Folder Image Uploader**: Ingests all images in a local directory with labels from a YAML file and creates a task in CVAT without filtering. |
 | [`report-cvat-balance.py`](report-cvat-balance.py) | **CVAT Dataset Balance Auditor**: Inspects annotation distributions across CVAT tasks/jobs, calculating class deficits, health status, and visual bars. |
-| [`train.sh`](train.sh) | **Unified Pipeline Runner**: Automates CVAT export, local GPU or remote Spark training (`-p spark`, `-p spark-yolo26n`), ONNX export, INT8 quantization, TOSA lowering, Torq compilation, and deployment. |
-| [`config_utils.py`](config_utils.py) | **Configuration Engine**: Parses `config.yaml`, resolves execution profiles, normalizes balance modes, maps COCO-80 classes, and dumps shell variables for `train.sh`. |
+| [`train.sh`](train.sh) | **Unified Pipeline Runner**: Automates CVAT export, local GPU or remote Spark training (`-p torq-spark`, `-p nvidia-spark`, `-p hailo-spark`), ONNX export, INT8 quantization, TOSA/Torq or Hailo-10H `.hef` compilation, deployment, and phase timing reports. |
+| [`config_utils.py`](config_utils.py) | **Configuration & Shared Evaluation Engine**: Parses `config.yaml`, resolves execution profiles, normalizes balance modes, maps COCO-80 + custom classes, provides shared IoU/ground-truth/dataset-pair evaluation helpers, and dumps shell variables for `train.sh`. |
 | [`export-cvat-to-yolo.py`](export-cvat-to-yolo.py) | **CVAT Exporter**: Connects to CVAT REST API and exports annotations to `datasets/yolo/` with train/val splits and `data.yaml`. |
 | [`deploy_to_coralboard.sh`](deploy_to_coralboard.sh) | **Model Deployer**: Deploys compiled `.vmfb` and `labels.json` to Coralboard locally or via SCP, with optional SSH service restart and HTTP health checks. |
 | [`test_server_accuracy.py`](test_server_accuracy.py) | **Server Accuracy Benchmark**: Evaluates running vision proxy against dataset images and COCO reference images, measuring precision, recall, F1, and NPU latency. |
 | [`test_nvidia_accuracy.py`](test_nvidia_accuracy.py) | **NVIDIA Model Benchmark**: Evaluates exported ONNX or PyTorch models on CUDA GPU/CPU against dataset, Frigate+, and COCO reference images with latency and mIoU. |
-| [`prepare_for_onnx2tf.py`](prepare_for_onnx2tf.py) | **ONNX Normalizer**: Divides ONNX box coordinates by 320.0, generates class-balanced INT8 calibration `.npy`, and writes `labels.json` and Frigate `labels.txt`. |
-| [`tests/`](tests/) | **Automated Test Suite**: Pytest unit tests validating configuration resolution, balancing algorithms, accuracy calculations, and dataset conversions. |
+| [`prepare_for_onnx2tf.py`](prepare_for_onnx2tf.py) | **ONNX & Calibration Helper**: Normalizes ONNX box coordinates, generates class-balanced INT8 calibration `.npy` arrays or Hailo calibration image directories, and writes `labels.json` and Frigate `labels.txt` with soft links. |
+| [`tests/`](tests/) | **Automated Test Suite**: Pytest unit tests validating configuration resolution, balancing algorithms, accuracy calculations, ONNX/calibration preparation, and dataset conversions. |

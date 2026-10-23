@@ -74,6 +74,9 @@ def create_progress_bar(percentage: float, width: int = 24) -> str:
     return bar
 
 
+count_cvat_annotations = config_utils.count_cvat_annotations
+
+
 def fetch_cvat_data(
     base_url: str,
     auth: Tuple[str, str],
@@ -132,20 +135,7 @@ def fetch_cvat_data(
 
         # Retrieve task-level annotations
         r_ann = session.get(f"{base_url}/api/tasks/{tid}/annotations", timeout=15).json()
-        shapes = r_ann.get("shapes", [])
-        tracks = r_ann.get("tracks", [])
-        tags = r_ann.get("tags", [])
-
-        task_counts = Counter()
-        for s in shapes:
-            name = label_id_to_name.get(s["label_id"], f"label_{s['label_id']}")
-            task_counts[name] += 1
-        for tr in tracks:
-            name = label_id_to_name.get(tr["label_id"], f"label_{tr['label_id']}")
-            task_counts[name] += 1
-        for tg in tags:
-            name = label_id_to_name.get(tg["label_id"], f"label_{tg['label_id']}")
-            task_counts[name] += 1
+        task_counts = count_cvat_annotations(r_ann, label_id_to_name)
 
         task_total_ann = sum(task_counts.values())
         total_annotations += task_total_ann
@@ -162,16 +152,7 @@ def fetch_cvat_data(
                 jstatus = j.get("status", "unknown")
 
                 r_jann = session.get(f"{base_url}/api/jobs/{jid}/annotations", timeout=10).json()
-                job_counts = Counter()
-                for s in r_jann.get("shapes", []):
-                    name = label_id_to_name.get(s["label_id"], f"label_{s['label_id']}")
-                    job_counts[name] += 1
-                for tr in r_jann.get("tracks", []):
-                    name = label_id_to_name.get(tr["label_id"], f"label_{tr['label_id']}")
-                    job_counts[name] += 1
-                for tg in r_jann.get("tags", []):
-                    name = label_id_to_name.get(tg["label_id"], f"label_{tg['label_id']}")
-                    job_counts[name] += 1
+                job_counts = count_cvat_annotations(r_jann, label_id_to_name)
 
                 jobs_list.append({
                     "id": jid,

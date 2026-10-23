@@ -146,118 +146,10 @@ def load_class_names(dataset_dir: Path) -> Dict[int, str]:
         return {0: "person", 1: "dog", 2: "cat", 3: "car"}
 
 
-def collect_dataset_pairs(dataset_dir: Path, split: str) -> List[Tuple[Path, Path]]:
-    """Locate all matching (image_path, label_path) pairs."""
-    images_dir = dataset_dir / "images"
-    labels_dir = dataset_dir / "labels"
-
-    splits_to_check = ["val", "train"] if split == "all" else [split]
-    pairs = []
-
-    valid_extensions = {".jpg", ".jpeg", ".png", ".webp"}
-
-    for s in splits_to_check:
-        s_img_dir = images_dir / s
-        s_lbl_dir = labels_dir / s
-
-        if not s_img_dir.is_dir():
-            continue
-
-        for img_path in sorted(s_img_dir.iterdir()):
-            if img_path.suffix.lower() in valid_extensions:
-                lbl_path = s_lbl_dir / f"{img_path.stem}.txt"
-                if lbl_path.is_file():
-                    pairs.append((img_path, lbl_path))
-
-    return pairs
-
-
-def collect_coco_pairs(coco_dataset_name: str = "coco-val2017", datasets_dir: str = "datasets") -> List[Tuple[Path, Path]]:
-    """Locate all matching (image_path, label_path) pairs for the specified COCO dataset."""
-    try:
-        coco_info = config_utils.download_coco_dataset(coco_dataset_name, target_dir=datasets_dir)
-        val_img_dir = Path(coco_info.get("val_dir") or coco_info.get("train_dir"))
-    except Exception as e:
-        print(f"[WARN] Unable to prepare COCO dataset '{coco_dataset_name}': {e}")
-        return []
-
-    if not val_img_dir.is_dir():
-        print(f"[WARN] COCO image directory not found at: {val_img_dir}")
-        return []
-
-    # Map image directory to label directory (e.g. .../images/val2017 -> .../labels/val2017)
-    lbl_dir = Path(str(val_img_dir).replace(os.sep + "images" + os.sep, os.sep + "labels" + os.sep))
-    if not lbl_dir.is_dir():
-        lbl_dir = val_img_dir.parent.parent / "labels" / val_img_dir.name
-
-    if not lbl_dir.is_dir():
-        print(f"[WARN] COCO label directory not found at: {lbl_dir}")
-        return []
-
-    valid_extensions = {".jpg", ".jpeg", ".png", ".webp"}
-    pairs = []
-    for img_path in sorted(val_img_dir.iterdir()):
-        if img_path.suffix.lower() in valid_extensions:
-            lbl_path = lbl_dir / f"{img_path.stem}.txt"
-            if lbl_path.is_file():
-                pairs.append((img_path, lbl_path))
-
-    return pairs
-
-
-def parse_ground_truth(label_path: Path, img_w: int, img_h: int, class_names: Dict[int, str]) -> List[dict]:
-    """Parse normalized YOLO label file into absolute pixel bounding boxes."""
-    boxes = []
-    if not label_path.exists():
-        return boxes
-
-    coco_names = config_utils.get_coco_80_dict()
-
-    with open(label_path, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) < 5:
-                continue
-            class_id = int(parts[0])
-            cx = float(parts[1]) * img_w
-            cy = float(parts[2]) * img_h
-            w = float(parts[3]) * img_w
-            h = float(parts[4]) * img_h
-
-            x1 = max(0.0, cx - w / 2.0)
-            y1 = max(0.0, cy - h / 2.0)
-            x2 = min(float(img_w), cx + w / 2.0)
-            y2 = min(float(img_h), cy + h / 2.0)
-
-            label_name = class_names.get(class_id) or coco_names.get(class_id, str(class_id))
-            label_name = str(label_name).lower()
-            boxes.append({
-                "class_id": class_id,
-                "label": label_name,
-                "bbox": [x1, y1, x2, y2],
-                "matched": False,
-            })
-    return boxes
-
-
-def compute_iou(boxA: List[float], boxB: List[float]) -> float:
-    """Calculate Intersection-over-Union between two [x1, y1, x2, y2] boxes."""
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    inter_w = max(0.0, xB - xA)
-    inter_h = max(0.0, yB - yA)
-    inter_area = inter_w * inter_h
-
-    areaA = max(0.0, boxA[2] - boxA[0]) * max(0.0, boxA[3] - boxA[1])
-    areaB = max(0.0, boxB[2] - boxB[0]) * max(0.0, boxB[3] - boxB[1])
-
-    union_area = areaA + areaB - inter_area
-    if union_area <= 0:
-        return 0.0
-    return inter_area / union_area
+collect_dataset_pairs = config_utils.collect_dataset_pairs
+collect_coco_pairs = config_utils.collect_coco_pairs
+parse_ground_truth = config_utils.parse_ground_truth
+compute_iou = config_utils.compute_iou
 
 
 def check_server_health(server_url: str) -> None:
@@ -467,37 +359,7 @@ def evaluate(args):
                 stats_per_class[pred_lbl] = {"gt": 0, "pred": 0, "tp": 0, "fp": 0, "fn": 0, "ious": []}
             stats_per_class[pred_lbl]["pred"] += 1
 
-        # Sort predictions by confidence descending
-        parsed_preds.sort(key=lambda x: x["confidence"], reverse=True)
-
-        # Match predictions against ground truth
-        for pred in parsed_preds:
-            best_iou = 0.0
-            best_gt_idx = -1
-
-            for gt_idx, gt in enumerate(gt_boxes):
-                if gt["matched"]:
-                    continue
-                if gt["label"] != pred["label"]:
-                    continue
-
-                iou = compute_iou(pred["bbox"], gt["bbox"])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt_idx = gt_idx
-
-            if best_iou >= args.iou_threshold and best_gt_idx >= 0:
-                gt_boxes[best_gt_idx]["matched"] = True
-                pred["matched"] = True
-                stats_per_class[pred["label"]]["tp"] += 1
-                stats_per_class[pred["label"]]["ious"].append(best_iou)
-            else:
-                stats_per_class[pred["label"]]["fp"] += 1
-
-        # Any unmatched GT boxes are false negatives
-        for gt in gt_boxes:
-            if not gt["matched"]:
-                stats_per_class[gt["label"]]["fn"] += 1
+        config_utils.match_predictions_to_gt(parsed_preds, gt_boxes, args.iou_threshold, stats_per_class)
 
         if args.verbose:
             print(f"[{idx:02d}/{len(selected_pairs):02d}] {img_path.name} | GT: {len(gt_boxes)} | Preds: {len(parsed_preds)} | {latency_ms:.1f}ms")
@@ -505,17 +367,16 @@ def evaluate(args):
     # -------------------------------------------------------------------------
     # Generate Output Report
     # -------------------------------------------------------------------------
-    total_gt = sum(v["gt"] for v in stats_per_class.values())
-    total_pred = sum(v["pred"] for v in stats_per_class.values())
-    total_tp = sum(v["tp"] for v in stats_per_class.values())
-    total_fp = sum(v["fp"] for v in stats_per_class.values())
-    total_fn = sum(v["fn"] for v in stats_per_class.values())
-    all_ious = [iou for v in stats_per_class.values() for iou in v["ious"]]
-
-    overall_prec = (total_tp / (total_tp + total_fp) * 100.0) if (total_tp + total_fp) > 0 else 0.0
-    overall_rec = (total_tp / (total_tp + total_fn) * 100.0) if (total_tp + total_fn) > 0 else 0.0
-    overall_f1 = (2 * overall_prec * overall_rec / (overall_prec + overall_rec)) if (overall_prec + overall_rec) > 0 else 0.0
-    overall_miou = (sum(all_ious) / len(all_ious)) if all_ious else 0.0
+    overall_summary, class_report_data, sorted_classes = config_utils.summarize_class_metrics(stats_per_class)
+    total_gt = overall_summary["gt"]
+    total_pred = overall_summary["pred"]
+    total_tp = overall_summary["tp"]
+    total_fp = overall_summary["fp"]
+    total_fn = overall_summary["fn"]
+    overall_prec = overall_summary["raw_precision"]
+    overall_rec = overall_summary["raw_recall"]
+    overall_f1 = overall_summary["raw_f1"]
+    overall_miou = overall_summary["raw_miou"]
 
     print("=" * 90)
     print("                    CORALBOARD TORQ NPU ACCURACY REPORT")
@@ -527,39 +388,11 @@ def evaluate(args):
     print(f"{'Class':<12} {'GT':>6} {'Pred':>6} {'TP':>6} {'FP':>6} {'FN':>6} {'Precision':>11} {'Recall':>10} {'F1-Score':>10} {'mIoU':>8}")
     print("-" * 90)
 
-    # Sort classes: active classes first, then alphabetical
-    sorted_classes = sorted(
-        stats_per_class.keys(),
-        key=lambda c: (stats_per_class[c]["gt"] == 0 and stats_per_class[c]["pred"] == 0, c),
-    )
-
-    class_report_data = {}
-
     for c in sorted_classes:
         st = stats_per_class[c]
-        gt_c = st["gt"]
-        pred_c = st["pred"]
-        tp_c = st["tp"]
-        fp_c = st["fp"]
-        fn_c = st["fn"]
-
-        prec_c = (tp_c / (tp_c + fp_c) * 100.0) if (tp_c + fp_c) > 0 else 0.0
-        rec_c = (tp_c / (tp_c + fn_c) * 100.0) if (tp_c + fn_c) > 0 else 0.0
-        f1_c = (2 * prec_c * rec_c / (prec_c + rec_c)) if (prec_c + rec_c) > 0 else 0.0
-        miou_c = (sum(st["ious"]) / len(st["ious"])) if st["ious"] else 0.0
-
-        class_report_data[c] = {
-            "gt": gt_c,
-            "pred": pred_c,
-            "tp": tp_c,
-            "fp": fp_c,
-            "fn": fn_c,
-            "precision": round(prec_c, 2),
-            "recall": round(rec_c, 2),
-            "f1_score": round(f1_c, 2),
-            "mean_iou": round(miou_c, 3),
-            "tested": bool(gt_c > 0),
-        }
+        cm = class_report_data[c]
+        gt_c, pred_c, tp_c, fp_c, fn_c = cm["gt"], cm["pred"], cm["tp"], cm["fp"], cm["fn"]
+        prec_c, rec_c, f1_c, miou_c = cm["precision"], cm["recall"], cm["f1_score"], cm["mean_iou"]
 
         # Format output
         p_str = f"{prec_c:6.1f}%" if (tp_c + fp_c) > 0 else "   N/A"

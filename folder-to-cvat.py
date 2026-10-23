@@ -105,31 +105,7 @@ def collect_images(folder_path: str | Path) -> List[Path]:
     return images
 
 
-def save_cvat_task_state(
-    task_id: int,
-    task_name: str,
-    cvat_url: str,
-    task_url: str,
-    base_dir: Optional[Path] = None,
-) -> Path:
-    """Save task info to .last_cvat_task."""
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent
-
-    state_data = {
-        "task_id": task_id,
-        "task_name": task_name,
-        "cvat_url": cvat_url,
-        "task_url": task_url,
-        "created_at": datetime.datetime.now().isoformat(),
-    }
-    state_file = base_dir / ".last_cvat_task"
-    try:
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state_data, f, indent=2)
-    except Exception as e:
-        print(f"[WARN] Failed to write state to {state_file}: {e}")
-    return state_file
+save_cvat_task_state = config_utils.save_cvat_task_state
 
 
 def upload_folder_to_cvat(

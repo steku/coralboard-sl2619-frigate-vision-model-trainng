@@ -3,10 +3,13 @@
 Shared configuration, CVAT client, and model metadata utilities for Frigate training.
 """
 
+from collections import Counter
+import datetime
+import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import yaml
 
 DEFAULT_CONFIG_FILES = [
@@ -121,25 +124,25 @@ def load_dataset_classes(data_yaml_path: str = "datasets/data.yaml") -> Dict[int
                 break
 
     if not p.is_file():
-        # Check fallback to models/labels/*.json
-        labels_dir = Path("models/labels")
-        if labels_dir.is_dir():
-            candidates = [
-                labels_dir / "torq_yolov8n.json",
-                labels_dir / "nvidia_yolov9s.json",
-                labels_dir / "hailo_yolov8m.json",
-                labels_dir / "labels.json",
-            ] + sorted(labels_dir.glob("*.json"))
-            for f in candidates:
-                if f.is_file():
-                    try:
-                        import json
-                        with open(f, "r", encoding="utf-8") as jf:
-                            d = json.load(jf)
-                            if "names" in d:
-                                return {int(k): str(v) for k, v in d["names"].items()}
-                    except Exception:
-                        pass
+        # Check fallback to models/labels/*.json only when using default dataset paths
+        if data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml", "yolo_dataset/data.yaml"):
+            labels_dir = Path("models/labels")
+            if labels_dir.is_dir():
+                candidates = [
+                    labels_dir / "torq_yolov8n.json",
+                    labels_dir / "nvidia_yolov9s.json",
+                    labels_dir / "hailo_yolov8m.json",
+                    labels_dir / "labels.json",
+                ] + sorted(labels_dir.glob("*.json"))
+                for f in candidates:
+                    if f.is_file():
+                        try:
+                            with open(f, "r", encoding="utf-8") as jf:
+                                d = json.load(jf)
+                                if "names" in d:
+                                    return {int(k): str(v) for k, v in d["names"].items()}
+                        except Exception:
+                            pass
         raise FileNotFoundError(f"Dataset config not found at {data_yaml_path}")
 
     with open(p, "r", encoding="utf-8") as f:
@@ -150,7 +153,9 @@ def load_dataset_classes(data_yaml_path: str = "datasets/data.yaml") -> Dict[int
         return {i: str(name) for i, name in enumerate(names)}
     elif isinstance(names, dict):
         return {int(k): str(v) for k, v in names.items()}
-    return {}
+    elif names is None:
+        return {}
+    raise ValueError(f"Invalid 'names' format in {data_yaml_path}")
 
 
 def get_deployment_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -520,7 +525,7 @@ def get_profile(
 ) -> Dict[str, Any]:
     """
     Resolve execution profile from config.yaml.
-    Supports named profiles (e.g. 'torq', 'spark-torq', 'nvidia', 'spark-nvidia', 'cpu-torq').
+    Supports named profiles (e.g. 'torq', 'torq-spark', 'torq-spark-yolo26n', 'nvidia', 'nvidia-spark', 'hailo', 'hailo-spark', 'cpu-torq').
     """
     if cfg is None:
         cfg = load_config(config_path)
@@ -719,6 +724,265 @@ def dump_profile_env(
         f"PROFILE_FRIGATE_PLUS_DIR='{p['frigate_plus_dir']}'",
     ]
     return "\n".join(lines)
+
+
+# ==============================================================================
+# Shared CVAT Task State & Dataset Evaluation Utilities
+# ==============================================================================
+def save_cvat_task_state(
+    task_id: int,
+    task_name: str,
+    cvat_url: str,
+    task_url: str,
+    base_dir: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Save state to .last_cvat_task for automated pipeline pickup."""
+    if base_dir is None:
+        base_dir = Path(__file__).resolve().parent
+    state_path = Path(base_dir) / ".last_cvat_task"
+
+    state_data = {
+        "task_id": task_id,
+        "task_name": task_name,
+        "cvat_url": cvat_url,
+        "task_url": task_url,
+        "created_at": datetime.datetime.now().isoformat(),
+    }
+    try:
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state_data, f, indent=2)
+    except Exception:
+        pass
+    return state_path
+
+
+def count_cvat_annotations(
+    ann_payload: Dict[str, Any], label_id_to_name: Dict[int, str]
+) -> Counter:
+    """Count shapes, tracks, and tags per class name from CVAT annotations payload."""
+    counts: Counter = Counter()
+    for key in ("shapes", "tracks", "tags"):
+        for item in ann_payload.get(key, []):
+            lid = item.get("label_id")
+            name = label_id_to_name.get(lid, f"label_{lid}")
+            counts[name] += 1
+    return counts
+
+
+def collect_dataset_pairs(
+    dataset_dir: Union[str, Path], split: str = "all"
+) -> List[Tuple[Path, Path]]:
+    """Locate all matching (image_path, label_path) pairs for the requested split."""
+    dataset_path = Path(dataset_dir)
+    splits_to_scan = ["val", "train"] if split == "all" else [split]
+    valid_extensions = {".jpg", ".jpeg", ".png", ".webp"}
+    pairs: List[Tuple[Path, Path]] = []
+    seen_stems = set()
+
+    for sp in splits_to_scan:
+        img_dir = dataset_path / "images" / sp
+        lbl_dir = dataset_path / "labels" / sp
+
+        if not img_dir.is_dir() or not lbl_dir.is_dir():
+            continue
+
+        for img_path in sorted(img_dir.iterdir()):
+            if img_path.suffix.lower() in valid_extensions:
+                if img_path.stem in seen_stems:
+                    continue
+                lbl_path = lbl_dir / f"{img_path.stem}.txt"
+                if lbl_path.is_file():
+                    pairs.append((img_path, lbl_path))
+                    seen_stems.add(img_path.stem)
+
+    return pairs
+
+
+def collect_coco_pairs(
+    coco_dataset_name: str = "coco128", datasets_dir: str = "datasets"
+) -> List[Tuple[Path, Path]]:
+    """Locate all matching (image_path, label_path) pairs for the specified COCO dataset."""
+    try:
+        coco_info = download_coco_dataset(coco_dataset_name, target_dir=datasets_dir)
+        val_img_dir = Path(coco_info.get("val_dir") or coco_info.get("train_dir"))
+    except Exception as e:
+        print(f"[WARN] Unable to prepare COCO dataset '{coco_dataset_name}': {e}")
+        return []
+
+    if not val_img_dir.is_dir():
+        print(f"[WARN] COCO image directory not found at: {val_img_dir}")
+        return []
+
+    lbl_dir = Path(str(val_img_dir).replace(os.sep + "images" + os.sep, os.sep + "labels" + os.sep))
+    if not lbl_dir.is_dir():
+        lbl_dir = val_img_dir.parent.parent / "labels" / val_img_dir.name
+
+    if not lbl_dir.is_dir():
+        print(f"[WARN] COCO label directory not found at: {lbl_dir}")
+        return []
+
+    valid_extensions = {".jpg", ".jpeg", ".png", ".webp"}
+    pairs: List[Tuple[Path, Path]] = []
+    for img_path in sorted(val_img_dir.iterdir()):
+        if img_path.suffix.lower() in valid_extensions:
+            lbl_path = lbl_dir / f"{img_path.stem}.txt"
+            if lbl_path.is_file():
+                pairs.append((img_path, lbl_path))
+
+    return pairs
+
+
+def parse_ground_truth(
+    label_path: Union[str, Path],
+    img_w: int,
+    img_h: int,
+    class_names: Dict[int, str],
+) -> List[Dict[str, Any]]:
+    """Parse normalized YOLO label file into absolute pixel bounding boxes."""
+    label_path = Path(label_path)
+    boxes: List[Dict[str, Any]] = []
+    if not label_path.exists():
+        return boxes
+
+    coco_names = get_coco_80_dict()
+    with open(label_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            class_id = int(parts[0])
+            cx = float(parts[1]) * img_w
+            cy = float(parts[2]) * img_h
+            w = float(parts[3]) * img_w
+            h = float(parts[4]) * img_h
+
+            x1 = max(0.0, cx - w / 2.0)
+            y1 = max(0.0, cy - h / 2.0)
+            x2 = min(float(img_w), cx + w / 2.0)
+            y2 = min(float(img_h), cy + h / 2.0)
+
+            label_name = class_names.get(class_id) or coco_names.get(class_id, str(class_id))
+            boxes.append({
+                "class_id": class_id,
+                "label": str(label_name).lower(),
+                "bbox": [x1, y1, x2, y2],
+                "matched": False,
+            })
+    return boxes
+
+
+def compute_iou(boxA: List[float], boxB: List[float]) -> float:
+    """Calculate Intersection-over-Union between two [x1, y1, x2, y2] boxes."""
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    inter_w = max(0.0, xB - xA)
+    inter_h = max(0.0, yB - yA)
+    inter_area = inter_w * inter_h
+
+    areaA = max(0.0, boxA[2] - boxA[0]) * max(0.0, boxA[3] - boxA[1])
+    areaB = max(0.0, boxB[2] - boxB[0]) * max(0.0, boxB[3] - boxB[1])
+
+    union_area = areaA + areaB - inter_area
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
+
+
+def match_predictions_to_gt(
+    parsed_preds: List[Dict[str, Any]],
+    gt_boxes: List[Dict[str, Any]],
+    iou_threshold: float,
+    stats_per_class: Dict[str, Dict[str, Any]],
+) -> None:
+    """Greedily match confidence-sorted predictions against ground truth boxes and update stats_per_class."""
+    parsed_preds.sort(key=lambda x: x["confidence"], reverse=True)
+
+    for pred in parsed_preds:
+        best_iou = 0.0
+        best_gt_idx = -1
+        for gt_idx, gt in enumerate(gt_boxes):
+            if gt["matched"] or gt["label"] != pred["label"]:
+                continue
+            iou = compute_iou(pred["bbox"], gt["bbox"])
+            if iou > best_iou:
+                best_iou = iou
+                best_gt_idx = gt_idx
+
+        if best_iou >= iou_threshold and best_gt_idx >= 0:
+            gt_boxes[best_gt_idx]["matched"] = True
+            pred["matched"] = True
+            stats_per_class[pred["label"]]["tp"] += 1
+            stats_per_class[pred["label"]]["ious"].append(best_iou)
+        else:
+            stats_per_class[pred["label"]]["fp"] += 1
+
+    for gt in gt_boxes:
+        if not gt["matched"]:
+            stats_per_class[gt["label"]]["fn"] += 1
+
+
+def summarize_class_metrics(
+    stats_per_class: Dict[str, Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], List[str]]:
+    """Aggregate per-class TP/FP/FN/IoU counts into overall and per-class precision/recall/F1/mIoU."""
+    total_gt = sum(v["gt"] for v in stats_per_class.values())
+    total_pred = sum(v["pred"] for v in stats_per_class.values())
+    total_tp = sum(v["tp"] for v in stats_per_class.values())
+    total_fp = sum(v["fp"] for v in stats_per_class.values())
+    total_fn = sum(v["fn"] for v in stats_per_class.values())
+    all_ious = [iou for v in stats_per_class.values() for iou in v["ious"]]
+
+    overall_prec = (total_tp / (total_tp + total_fp) * 100.0) if (total_tp + total_fp) > 0 else 0.0
+    overall_rec = (total_tp / (total_tp + total_fn) * 100.0) if (total_tp + total_fn) > 0 else 0.0
+    overall_f1 = (2 * overall_prec * overall_rec / (overall_prec + overall_rec)) if (overall_prec + overall_rec) > 0 else 0.0
+    overall_miou = (sum(all_ious) / len(all_ious)) if all_ious else 0.0
+
+    sorted_classes = sorted(
+        stats_per_class.keys(),
+        key=lambda c: (stats_per_class[c]["gt"] == 0 and stats_per_class[c]["pred"] == 0, c),
+    )
+
+    class_report_data: Dict[str, Dict[str, Any]] = {}
+    for c in sorted_classes:
+        st = stats_per_class[c]
+        gt_c, pred_c, tp_c, fp_c, fn_c = st["gt"], st["pred"], st["tp"], st["fp"], st["fn"]
+        prec_c = (tp_c / (tp_c + fp_c) * 100.0) if (tp_c + fp_c) > 0 else 0.0
+        rec_c = (tp_c / (tp_c + fn_c) * 100.0) if (tp_c + fn_c) > 0 else 0.0
+        f1_c = (2 * prec_c * rec_c / (prec_c + rec_c)) if (prec_c + rec_c) > 0 else 0.0
+        miou_c = (sum(st["ious"]) / len(st["ious"])) if st["ious"] else 0.0
+
+        class_report_data[c] = {
+            "gt": gt_c,
+            "pred": pred_c,
+            "tp": tp_c,
+            "fp": fp_c,
+            "fn": fn_c,
+            "precision": round(prec_c, 2),
+            "recall": round(rec_c, 2),
+            "f1_score": round(f1_c, 2),
+            "mean_iou": round(miou_c, 3),
+            "tested": bool(gt_c > 0),
+        }
+
+    overall_summary = {
+        "gt": total_gt,
+        "pred": total_pred,
+        "tp": total_tp,
+        "fp": total_fp,
+        "fn": total_fn,
+        "precision": round(overall_prec, 2),
+        "recall": round(overall_rec, 2),
+        "f1_score": round(overall_f1, 2),
+        "mean_iou": round(overall_miou, 3),
+        "raw_precision": overall_prec,
+        "raw_recall": overall_rec,
+        "raw_f1": overall_f1,
+        "raw_miou": overall_miou,
+    }
+    return overall_summary, class_report_data, sorted_classes
 
 
 if __name__ == "__main__":
