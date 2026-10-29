@@ -94,7 +94,7 @@ COS_LR="True"
 WARMUP_EPOCHS="5.0"
 WARMUP_MOMENTUM="0.5"
 WARMUP_BIAS_LR="0.0"
-PROJECT="frigate"
+STAGING_ROOT="${SCRIPT_DIR}/staging"
 TARGET_FORMAT="torq"              # 'torq' (.vmfb for Coralboard NPU) or 'nvidia' (.onnx for NVIDIA GPU)
 BASE_MODEL="yolov8n.pt"
 RUN_NAME=""
@@ -129,10 +129,9 @@ FRIGATE_PLUS_DIR="datasets/frigate-plus"
 # Output directories
 TIMESTAMP="${FRIGATE_RUN_TIMESTAMP:-$(date +%y%m%d-%H%M)}"
 export FRIGATE_RUN_TIMESTAMP="${TIMESTAMP}"
-OUTPUT_DIR="output"
 MODELS_DIR="models"
 MODELS_BASE_DIR="${MODELS_DIR}/base"
-mkdir -p "${OUTPUT_DIR}" "${MODELS_BASE_DIR}"
+mkdir -p "${STAGING_ROOT}" "${MODELS_BASE_DIR}"
 
 # Logging options (both console and file enabled by default)
 LOG_CONSOLE="${FRIGATE_LOG_CONSOLE:-true}"
@@ -483,6 +482,9 @@ fi
 BASE_MODEL_NAME="$(basename "${BASE_MODEL%.*}")"
 RUN_NAME="${BASE_MODEL_NAME}"
 RUN_NAME_STEM="$(basename "${RUN_NAME%.*}")"
+STAGING_DIR="staging/${RUN_NAME}"
+OUTPUT_DIR="${STAGING_DIR}"
+mkdir -p "${OUTPUT_DIR}"
 LABELS_FILE="${MODELS_LABELS_DIR}/${TARGET_FORMAT}_${BASE_MODEL_NAME}_${TIMESTAMP}.json"
 OUTPUT_VMFB="${MODELS_COMPILED_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}_${TIMESTAMP}.vmfb"
 OUTPUT_ONNX="${MODELS_COMPILED_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}_${TIMESTAMP}.onnx"
@@ -583,7 +585,7 @@ fi
 # Step 2: Training / Checkpoint Selection
 # ------------------------------------------------------------------------------
 WEIGHTS_PATH=""
-LOCAL_WEIGHTS_DIR="runs/detect/${PROJECT}/${RUN_NAME}/weights"
+LOCAL_WEIGHTS_DIR="${STAGING_DIR}/weights"
 
 if [[ -n "${CUSTOM_MODEL_PT}" ]]; then
     if [[ ! -f "${CUSTOM_MODEL_PT}" ]]; then
@@ -597,10 +599,10 @@ if [[ -n "${CUSTOM_MODEL_PT}" ]]; then
     POSTPROCESS_START_TS=$(date +%s)
 
 elif [[ "${SKIP_TRAIN}" == "true" ]]; then
-    # Look for existing best.pt
-    LATEST_BEST=$(find "runs/detect" -path "*${RUN_NAME}*" -name "best.pt" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+    # Look for existing best.pt in staging/
+    LATEST_BEST=$(find "staging" -path "*${RUN_NAME}*" -name "best.pt" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
     if [[ -z "${LATEST_BEST}" ]]; then
-        LATEST_BEST=$(find "runs/detect" -path "*${BASE_MODEL_NAME}*" -name "best.pt" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+        LATEST_BEST=$(find "staging" -path "*${BASE_MODEL_NAME}*" -name "best.pt" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
     fi
     if [[ -z "${LATEST_BEST}" ]]; then
         log_err "No existing 'best.pt' found for '${RUN_NAME}'. Run without --compile to train first."
@@ -708,8 +710,8 @@ elif [[ "${RUNNER}" == "spark" ]]; then
 
         # Sync previous checkpoint if resuming or base model if present locally
         if [[ "${FROM_SCRATCH}" == "false" && -f "${LOCAL_WEIGHTS_DIR}/best.pt" ]]; then
-            ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/runs/detect/${PROJECT}/${RUN_NAME}/weights'"
-            scp "${LOCAL_WEIGHTS_DIR}/best.pt" "${SPARK_HOST}:${REMOTE_DIR}/runs/detect/${PROJECT}/${RUN_NAME}/weights/best.pt"
+            ssh "${SPARK_HOST}" "mkdir -p '${REMOTE_DIR}/staging/${RUN_NAME}/weights'"
+            scp "${LOCAL_WEIGHTS_DIR}/best.pt" "${SPARK_HOST}:${REMOTE_DIR}/staging/${RUN_NAME}/weights/best.pt"
         fi
         if [[ -f "models/base/${BASE_MODEL}" ]]; then
             scp "models/base/${BASE_MODEL}" "${SPARK_HOST}:${REMOTE_DIR}/models/base/"
@@ -743,7 +745,7 @@ elif [[ "${RUNNER}" == "spark" ]]; then
             fi
 
             if [ \"${FROM_SCRATCH}\" = \"false\" ]; then
-                LATEST_EXISTING=\$(find \"${REMOTE_DIR}/runs/detect/${PROJECT}\" -path \"*${RUN_NAME}*\" -name \"best.pt\" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d' ')
+                LATEST_EXISTING=\$(find \"${REMOTE_DIR}/staging\" -path \"*${RUN_NAME}*\" -name \"best.pt\" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d' ')
                 if [ -n \"\${LATEST_EXISTING}\" ] && [ -f \"\${LATEST_EXISTING}\" ]; then
                     echo \"[SPARK] Resuming training from existing checkpoint: \${LATEST_EXISTING}\"
                     START_MODEL=\"\${LATEST_EXISTING}\"
@@ -770,8 +772,9 @@ elif [[ "${RUNNER}" == "spark" ]]; then
                 warmup_momentum=${WARMUP_MOMENTUM} \
                 warmup_bias_lr=${WARMUP_BIAS_LR} \
                 device='${DEVICE}' \
-                project='${PROJECT}' \
+                project=\"${REMOTE_DIR}/staging\" \
                 name='${RUN_NAME}' \
+                exist_ok=True \
                 ${EXTRA_TRAIN_ARGS}
         "
         TRAINING_ELAPSED=$(( $(date +%s) - TRAIN_START_TS ))
@@ -783,15 +786,17 @@ elif [[ "${RUNNER}" == "spark" ]]; then
     mkdir -p "${LOCAL_WEIGHTS_DIR}" "models/base"
 
     REMOTE_BEST_PT=$(ssh "${SPARK_HOST}" "
-        find \"${REMOTE_DIR}/runs/detect/${PROJECT}\" -path \"*${RUN_NAME}*\" -name \"best.pt\" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d' '
+        find \"${REMOTE_DIR}/staging\" -path \"*${RUN_NAME}*\" -name \"best.pt\" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d' '
     ")
 
     if [[ -z "${REMOTE_BEST_PT}" ]]; then
-        log_err "Could not locate best.pt on ${SPARK_HOST}:${REMOTE_DIR}/runs/detect/${PROJECT}/"
+        log_err "Could not locate best.pt on ${SPARK_HOST}:${REMOTE_DIR}/staging/"
         exit 1
     fi
 
     scp "${SPARK_HOST}:${REMOTE_BEST_PT}" "${LOCAL_WEIGHTS_DIR}/best.pt"
+    REMOTE_RESULTS_CSV="$(dirname "$(dirname "${REMOTE_BEST_PT}")")/results.csv"
+    scp "${SPARK_HOST}:${REMOTE_RESULTS_CSV}" "${STAGING_DIR}/results.csv" 2>/dev/null || true
     WEIGHTS_PATH="${LOCAL_WEIGHTS_DIR}/best.pt"
     log_success "Trained weights retrieved successfully to ${LOCAL_WEIGHTS_DIR}/best.pt"
 
@@ -830,7 +835,7 @@ else
     fi
 
     if [[ "${FROM_SCRATCH}" == "false" ]]; then
-        LATEST_BEST=$(find "runs/detect" -path "*${RUN_NAME}*" -name "best.pt" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+        LATEST_BEST=$(find "staging" -path "*${RUN_NAME}*" -name "best.pt" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
         if [[ -n "${LATEST_BEST}" && -f "${LATEST_BEST}" ]]; then
             log_info "Found existing trained checkpoint: ${LATEST_BEST}. Fine-tuning from it..."
             START_MODEL="${LATEST_BEST}"
@@ -857,8 +862,9 @@ else
         warmup_momentum="${WARMUP_MOMENTUM}" \
         warmup_bias_lr="${WARMUP_BIAS_LR}" \
         device="${DEVICE}" \
-        project="${PROJECT}" \
+        project="${STAGING_ROOT}" \
         name="${RUN_NAME}" \
+        exist_ok=True \
         ${EXTRA_TRAIN_ARGS}
     TRAINING_ELAPSED=$(( $(date +%s) - TRAIN_START_TS ))
     POSTPROCESS_START_TS=$(date +%s)
@@ -868,7 +874,7 @@ else
 
     TRAINED_BEST="${LOCAL_WEIGHTS_DIR}/best.pt"
     if [[ ! -f "${TRAINED_BEST}" ]]; then
-        TRAINED_BEST=$(find "runs/detect/${PROJECT}" -path "*${RUN_NAME}*" -name "best.pt" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+        TRAINED_BEST=$(find "staging" -path "*${RUN_NAME}*" -name "best.pt" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
     fi
     if [[ -z "${TRAINED_BEST}" || ! -f "${TRAINED_BEST}" ]]; then
         log_err "Training completed but could not locate best.pt!"
@@ -990,9 +996,11 @@ elif [[ "${TARGET_FORMAT}" == "hailo" ]]; then
         else
             HMZ_YAML_ARG=("${RUN_NAME_STEM}")
         fi
+        STAGING_ABS="$(cd "${OUTPUT_DIR}" && pwd)"
+        cd "${STAGING_ABS}"
         hailomz compile \
-            --ckpt "${OUTPUT_DIR}/best.onnx" \
-            --calib-path "${HAILO_CALIB_DIR}" \
+            --ckpt "${STAGING_ABS}/best.onnx" \
+            --calib-path "${STAGING_ABS}/hailo_calib_imgs" \
             "${HMZ_YAML_ARG[@]}" \
             --end-node-names \
                 /model.22/cv2.0/cv2.0.2/Conv \
@@ -1005,9 +1013,9 @@ elif [[ "${TARGET_FORMAT}" == "hailo" ]]; then
             --hw-arch "${HW_ARCH}"
     )
 
-    GENERATED_HEF="${RUN_NAME_STEM}.hef"
-    if [[ ! -f "${GENERATED_HEF}" && -f "${OUTPUT_DIR}/${RUN_NAME_STEM}.hef" ]]; then
-        GENERATED_HEF="${OUTPUT_DIR}/${RUN_NAME_STEM}.hef"
+    GENERATED_HEF="${OUTPUT_DIR}/${RUN_NAME_STEM}.hef"
+    if [[ ! -f "${GENERATED_HEF}" && -f "${RUN_NAME_STEM}.hef" ]]; then
+        GENERATED_HEF="${RUN_NAME_STEM}.hef"
     fi
     if [[ ! -f "${GENERATED_HEF}" ]]; then
         log_err "hailomz compile failed to produce HEF binary '${RUN_NAME_STEM}.hef'"

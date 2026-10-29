@@ -35,10 +35,10 @@ def find_default_model() -> str:
     """Auto-detect the most appropriate default NVIDIA model (.onnx or .pt)."""
     candidates = [
         Path("models/nvidia/nvidia_yolov9s.onnx"),
-        Path("models/nvidia_yolov9s.onnx"),
-        Path("models/compiled/nvidia_yolov9s.onnx"),
-        Path("output/best_normalized_output.onnx"),
-        Path("output/best.onnx"),
+        Path("staging/yolov9s/best_normalized_output.onnx"),
+        Path("staging/yolov9s/best.onnx"),
+        Path("staging/best_normalized_output.onnx"),
+        Path("staging/best.onnx"),
     ]
     for c in candidates:
         if c.is_file():
@@ -52,16 +52,13 @@ def find_default_model() -> str:
         onnx_files = sorted(models_dir.glob("nvidia/nvidia_*.onnx"), key=lambda p: p.stat().st_mtime)
         if onnx_files:
             return str(onnx_files[-1])
-        onnx_files = sorted(models_dir.glob("*/nvidia_*.onnx"), key=lambda p: p.stat().st_mtime)
-        if onnx_files:
-            return str(onnx_files[-1])
         onnx_files = sorted(models_dir.glob("*/*/*.onnx"), key=lambda p: p.stat().st_mtime)
         if onnx_files:
             return str(onnx_files[-1])
 
-    runs_dir = Path("runs/detect")
-    if runs_dir.is_dir():
-        ckpts = sorted(runs_dir.glob("**/best.pt"), key=lambda p: p.stat().st_mtime)
+    staging_dir = Path("staging")
+    if staging_dir.is_dir():
+        ckpts = sorted(staging_dir.glob("**/best.pt"), key=lambda p: p.stat().st_mtime)
         if ckpts:
             return str(ckpts[-1])
 
@@ -210,10 +207,6 @@ def load_class_names(dataset_dir: Path, labels_path: Optional[str] = None) -> Di
     for candidate in [
         Path("models/nvidia/nvidia_yolov9s.json"),
         Path("models/nvidia/labels.json"),
-        Path("models/nvidia_yolov9s.json"),
-        Path("models/labels.json"),
-        Path("models/labels/nvidia_yolov9s.json"),
-        Path("models/labels/labels.json"),
         Path("labels.json"),
         dataset_dir / "data.yaml",
         Path("datasets/data.yaml"),

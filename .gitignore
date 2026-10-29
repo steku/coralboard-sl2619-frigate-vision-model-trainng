@@ -69,10 +69,11 @@ packages/*.deb
 *.engine
 *.trt
 
-# TensorFlow SavedModel directories & onnx2tf conversion outputs
+# TensorFlow SavedModel directories & staging/conversion outputs
 *_saved_model/
 saved_model/
 onnx2tf_*/
+staging/
 output/
 
 # Large serialized arrays & calibration datasets

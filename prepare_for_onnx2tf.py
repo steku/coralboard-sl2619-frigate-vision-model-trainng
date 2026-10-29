@@ -394,8 +394,12 @@ def step4_generate_labels_json(
 
     # If quantized TFLite model is available, include exact quantization parameters
     tflite_file = Path(tflite_path)
-    if not tflite_file.exists() and Path(f"output/{tflite_path}").exists():
-        tflite_file = Path(f"output/{tflite_path}")
+    if not tflite_file.exists():
+        for cand_prefix in (f"staging/{resolved_base}", "staging"):
+            cand_tflite = Path(f"{cand_prefix}/{tflite_path}")
+            if cand_tflite.exists():
+                tflite_file = cand_tflite
+                break
 
     if tflite_file.exists():
         try:
@@ -452,7 +456,7 @@ def _update_symlink(link_path: Path, target_path: Path) -> None:
             pass
 
 
-def find_latest_checkpoint(runs_dir: str = "runs/detect") -> str:
+def find_latest_checkpoint(runs_dir: str = "staging") -> str:
     path = Path(runs_dir)
     if path.is_dir():
         ckpts = sorted(path.glob("**/best.pt"), key=lambda p: p.stat().st_mtime)
@@ -465,9 +469,10 @@ def main():
     default_ckpt = find_latest_checkpoint()
     parser = argparse.ArgumentParser(description="Prepare ONNX and Calibration data for Torq compilation")
     parser.add_argument("--model-pt", default=default_ckpt, help=f"Path to best.pt checkpoint (default: {default_ckpt})")
-    default_raw_onnx = "output/best.onnx" if Path("output/best.onnx").exists() else "best.onnx"
-    default_norm_onnx = "output/best_normalized_output.onnx" if Path("output").exists() else "best_normalized_output.onnx"
-    default_calib = "output/calibration_video_300_nhwc_float32.npy" if Path("output").exists() else "calibration_video_300_nhwc_float32.npy"
+    default_staging = "staging" if Path("staging").exists() else ""
+    default_raw_onnx = f"{default_staging}/best.onnx" if default_staging else "best.onnx"
+    default_norm_onnx = f"{default_staging}/best_normalized_output.onnx" if default_staging else "best_normalized_output.onnx"
+    default_calib = f"{default_staging}/calibration_video_300_nhwc_float32.npy" if default_staging else "calibration_video_300_nhwc_float32.npy"
     parser.add_argument("--input-onnx", default=default_raw_onnx, help="Raw ONNX export input/target")
     parser.add_argument("--output-onnx", default=default_norm_onnx, help="Normalized ONNX output")
     parser.add_argument("--output-calib", default=default_calib, help=f"Path to output calibration .npy file (default: {default_calib})")

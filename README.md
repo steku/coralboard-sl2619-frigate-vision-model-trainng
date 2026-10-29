@@ -606,7 +606,7 @@ python report-cvat-balance.py --json
 ./train.sh -p torq-spark --pull
 
 # 10. Fast compilation of an existing checkpoint (skip training):
-./train.sh --compile runs/detect/frigate_coral/yolov8n/weights/best.pt
+./train.sh --compile staging/yolov8n/weights/best.pt
 
 # 11. Wipe and replace datasets/yolo instead of appending:
 ./train.sh --export all --replace
@@ -618,13 +618,13 @@ python report-cvat-balance.py --json
 ./train.sh -p nvidia-spark
 
 # 14. Compile an existing checkpoint to ONNX only for NVIDIA GPU:
-./train.sh -p nvidia --compile runs/detect/frigate_coral/yolov9s/weights/best.pt
+./train.sh -p nvidia --compile staging/yolov9s/weights/best.pt
 
 # 15. Train YOLOv8m (640x640) on Spark and compile to Hailo-10H (.hef):
 ./train.sh -p hailo-spark
 
 # 16. Compile an existing YOLOv8m checkpoint directly to Hailo-10H (.hef):
-./train.sh -p hailo --compile runs/detect/frigate_coral/yolov8m/weights/best.pt
+./train.sh -p hailo --compile staging/yolov8m/weights/best.pt
 ```
 
 #### Artifact Naming, Soft Links & Pipeline Timing Report
