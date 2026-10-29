@@ -488,13 +488,54 @@ def test_logging_setup_and_options(tmp_path, capsys, monkeypatch):
     assert "Console only message" in captured_console.out
     assert not (only_console_dir / "console_only_script.log").exists()
 
-    # 5. Stream stdin to logger (used by bash scripts)
-    monkeypatch.setattr("sys.stdin", io.StringIO("\033[0;32m[SUCCESS]\033[0m Bash step complete\n[ERROR] Bash failure\n"))
-    config_utils.stream_stdin_to_logger("train", log_to_console=True, log_to_file=True, log_dir=log_dir)
-    train_log_text = (log_dir / "train.log").read_text(encoding="utf-8")
-    assert "[INFO] [frigate.train] [SUCCESS] Bash step complete" in train_log_text
-    assert "[ERROR] [frigate.train] [ERROR] Bash failure" in train_log_text
-    assert "\033[" not in train_log_text
+
+def test_safe_extract_zip_and_zip_slip_protection(tmp_path):
+    import zipfile
+
+    # 1. Valid archive extracts cleanly
+    valid_zip = tmp_path / "valid.zip"
+    with zipfile.ZipFile(valid_zip, "w") as zf:
+        zf.writestr("sub/hello.txt", "safe content")
+
+    extract_dir = tmp_path / "extracted"
+    extract_dir.mkdir()
+    with zipfile.ZipFile(valid_zip, "r") as zf:
+        config_utils.safe_extract_zip(zf, extract_dir)
+    assert (extract_dir / "sub" / "hello.txt").read_text(encoding="utf-8") == "safe content"
+
+    # 2. Malicious Zip Slip archive is blocked
+    evil_zip = tmp_path / "evil.zip"
+    with zipfile.ZipFile(evil_zip, "w") as zf:
+        zf.writestr("../../escaped.txt", "pwned")
+
+    with zipfile.ZipFile(evil_zip, "r") as zf:
+        with pytest.raises(ValueError, match="Unsafe zip member path detected"):
+            config_utils.safe_extract_zip(zf, extract_dir)
+    assert not (tmp_path.parent / "escaped.txt").exists()
+
+
+def test_dump_deploy_env_and_shell_quote(tmp_path):
+    assert config_utils._shell_quote("simple") == "'simple'"
+    assert config_utils._shell_quote("a'b") == "'a'\\''b'"
+
+    custom_cfg = tmp_path / "deploy_cfg.yaml"
+    custom_cfg.write_text(
+        yaml.safe_dump(
+            {
+                "deployment": {
+                    "host": "root@192.168.100.2:/models",
+                    "dir": "/opt/models",
+                    "restart_service": True,
+                    "service_name": "coral-vision",
+                }
+            }
+        )
+    )
+    env_out = config_utils.dump_deploy_env(str(custom_cfg))
+    assert "CFG_HOST='root@192.168.100.2:/models'" in env_out
+    assert "CFG_DIR='/opt/models'" in env_out
+    assert "CFG_RESTART='true'" in env_out
+    assert "CFG_SERVICE='coral-vision'" in env_out
 
 
 

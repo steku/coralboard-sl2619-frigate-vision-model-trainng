@@ -216,7 +216,7 @@ def step3_prepare_calibration(
 ):
     yaml_path = Path(data_yaml_path)
     if not yaml_path.exists() and data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
-        for cand in ("datasets/data.yaml", "datasets/yolo/data.yaml", "yolo_dataset/data.yaml"):
+        for cand in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
             if Path(cand).exists():
                 yaml_path = Path(cand)
                 break
@@ -232,7 +232,7 @@ def step3_prepare_calibration(
     else:
         names = {}
 
-    dataset_root = Path(data.get("path", "datasets" if Path("datasets").exists() else ("datasets/yolo" if Path("datasets/yolo").exists() else "yolo_dataset")))
+    dataset_root = Path(data.get("path", "datasets" if Path("datasets").exists() else "datasets/yolo"))
     val_rel = data.get("val", "images/val")
     train_rel = data.get("train", "images/train")
 

@@ -74,7 +74,7 @@ def load_processed_events(base_dir=None, yolo_dir=None, output_dir=None):
             print(f"[WARN] Failed to read {tracker_file}: {e}")
 
     # 2. Scan YOLO dataset (images & labels)
-    yolo_candidates = [Path(yolo_dir)] if yolo_dir else [base_dir / "datasets" / "yolo", base_dir / "yolo_dataset"]
+    yolo_candidates = [Path(yolo_dir)] if yolo_dir else [base_dir / "datasets" / "yolo"]
     for yolo_path in yolo_candidates:
         if yolo_path.is_dir():
             for p in yolo_path.glob("**/*.*"):
@@ -518,8 +518,6 @@ def load_config(config_path=None):
         storage_cfg = cfg.get("storage", {})
         if isinstance(storage_cfg, dict) and "output_dir" in storage_cfg:
             defaults["output_dir"] = str(storage_cfg["output_dir"]).strip()
-        elif "output_dir" in cfg:
-            defaults["output_dir"] = str(cfg["output_dir"]).strip()
 
         # Parse categories / labels
         if "categories" in cfg and isinstance(cfg["categories"], dict):

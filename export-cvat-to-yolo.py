@@ -130,7 +130,7 @@ def export_and_prepare_yolo(
 
             print(f"[INFO] Extracting exported archive for task {task.id}...")
             with zipfile.ZipFile(temp_zip, "r") as zf:
-                zf.extractall(temp_extract)
+                config_utils.safe_extract_zip(zf, temp_extract)
 
             # Discover classes
             names_file = temp_extract / "obj.names"

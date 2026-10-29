@@ -74,42 +74,27 @@ packages/*.deb
 saved_model/
 onnx2tf_*/
 staging/
-output/
+weights/
 
 # Large serialized arrays & calibration datasets
 *.npy
 *.npz
-calibration_*.npy
 
-# Local model storage directory & class label mappings
+# Local model storage directory
 models/
-labels.json
-labels_*.json
 
 # ------------------------------------------------------------------------------
-# Training Runs, Evaluation Artifacts & Experiment Trackers
+# Training Logs & Experiment Trackers
 # ------------------------------------------------------------------------------
-runs/
-results/
+logs/
+*.log
 wandb/
 .tensorboard/
 lightning_logs/
-logs/
-*.log
 
 # ------------------------------------------------------------------------------
 # Datasets, Image Batches & Annotations
 # ------------------------------------------------------------------------------
-# Downloaded snapshots and COCO annotations from Frigate
-datasets/staging/
-cvat_dataset/
-
-# YOLO formatted datasets & configs
-datasets/yolo/
-yolo_dataset/
-*_dataset/
-
-# General datasets folder
 datasets/
 
 # Temporary CVAT export archives, bundles & state

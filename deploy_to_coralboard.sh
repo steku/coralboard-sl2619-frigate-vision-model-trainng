@@ -35,10 +35,13 @@ DEPLOY_DIR="${DEPLOY_DIR:-}"
 RESTART_SERVICE=false
 SERVICE_NAME="coralboard-sl2619-vision"
 DO_HEALTH_CHECK=false
-LOG_CONSOLE="${FRIGATE_LOG_CONSOLE:-true}"
-LOG_FILE="${FRIGATE_LOG_FILE:-true}"
+LOG_CONSOLE="${FRIGATE_LOG_CONSOLE:-}"
+LOG_FILE="${FRIGATE_LOG_FILE:-}"
 LOG_DIR="${FRIGATE_LOG_DIR:-}"
-ORIG_ARGS=("$@")
+TIMESTAMP="${FRIGATE_RUN_TIMESTAMP:-$(date +%y%m%d-%H%M)}"
+
+[[ -t 0 ]] && stty onlcr 2>/dev/null || true
+trap '[[ -t 0 ]] && stty onlcr 2>/dev/null || true' EXIT INT TERM
 
 PYTHON_BIN="python3"
 if [[ -x "./venv-torq-312/bin/python" ]]; then
@@ -49,27 +52,23 @@ fi
 
 # Load settings from config.yaml if available
 if [[ -f "config.yaml" ]]; then
-
-    ${PYTHON_BIN} -c "import yaml" &>/dev/null && {
-        CFG_HOST=$(${PYTHON_BIN} -c "import yaml; c=yaml.safe_load(open('config.yaml')).get('deployment',{}) or {}; print(c.get('host') or '')" 2>/dev/null || true)
-        CFG_DIR=$(${PYTHON_BIN} -c "import yaml; c=yaml.safe_load(open('config.yaml')).get('deployment',{}) or {}; print(c.get('dir') or '')" 2>/dev/null || true)
-        CFG_RESTART=$(${PYTHON_BIN} -c "import yaml; c=yaml.safe_load(open('config.yaml')).get('deployment',{}) or {}; print('true' if c.get('restart_service') else 'false')" 2>/dev/null || true)
-        CFG_SERVICE=$(${PYTHON_BIN} -c "import yaml; c=yaml.safe_load(open('config.yaml')).get('deployment',{}) or {}; print(c.get('service_name') or '')" 2>/dev/null || true)
-
-        if [[ -z "${DEPLOY_HOST}" && -n "${CFG_HOST}" ]]; then
+    if eval "$(${PYTHON_BIN} "${SCRIPT_DIR}/config_utils.py" --deploy-env 2>/dev/null)"; then
+        if [[ -z "${DEPLOY_HOST}" && -n "${CFG_HOST:-}" ]]; then
             DEPLOY_HOST="${CFG_HOST}"
         fi
-        if [[ -z "${DEPLOY_DIR}" && -n "${CFG_DIR}" ]]; then
+        if [[ -z "${DEPLOY_DIR}" && -n "${CFG_DIR:-}" ]]; then
             DEPLOY_DIR="${CFG_DIR}"
         fi
-        if [[ "${CFG_RESTART}" == "true" ]]; then
+        if [[ "${CFG_RESTART:-}" == "true" ]]; then
             RESTART_SERVICE=true
         fi
-        if [[ -n "${CFG_SERVICE}" ]]; then
+        if [[ -n "${CFG_SERVICE:-}" ]]; then
             SERVICE_NAME="${CFG_SERVICE}"
         fi
-    } || true
+    fi
 fi
+LOG_CONSOLE="${LOG_CONSOLE:-${CFG_LOG_CONSOLE:-true}}"
+LOG_FILE="${LOG_FILE:-${CFG_LOG_FILE:-true}}"
 
 # ------------------------------------------------------------------------------
 # Usage & Help
@@ -166,29 +165,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "${FRIGATE_DEPLOY_LOGGING_ACTIVE:-}" ]]; then
-    export FRIGATE_DEPLOY_LOGGING_ACTIVE=1
-    export FRIGATE_LOG_CONSOLE="${LOG_CONSOLE}"
-    export FRIGATE_LOG_FILE="${LOG_FILE}"
-    if [[ "${LOG_FILE}" == "true" && -z "${FRIGATE_LOG_DIR:-}" ]]; then
-        export FRIGATE_LOG_DIR="$(${PYTHON_BIN} "${SCRIPT_DIR}/config_utils.py" --init-log-dir --target torq ${LOG_DIR:+--log-dir "${LOG_DIR}"})"
-    elif [[ -n "${LOG_DIR}" ]]; then
-        export FRIGATE_LOG_DIR="$(${PYTHON_BIN} "${SCRIPT_DIR}/config_utils.py" --init-log-dir --target torq --log-dir "${LOG_DIR}")"
-    fi
-    STREAM_ARGS=(--stream-log "deploy_to_coralboard" --target "torq")
-    [[ -n "${FRIGATE_LOG_DIR:-}" ]] && STREAM_ARGS+=(--log-dir "${FRIGATE_LOG_DIR}")
+if [[ "${LOG_FILE}" == "true" ]]; then
+    TARGET_LOG_DIR="${LOG_DIR:-models/torq/${TIMESTAMP}/logs}"
+    mkdir -p "${TARGET_LOG_DIR}"
+    DEPLOY_LOG_FILE="$(cd "${TARGET_LOG_DIR}" && pwd)/deploy_to_coralboard.log"
     if [[ "${LOG_CONSOLE}" == "true" ]]; then
-        STREAM_ARGS+=(--log-console)
+        exec > >(tee -a >(sed -u $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' >> "${DEPLOY_LOG_FILE}")) 2>&1
     else
-        STREAM_ARGS+=(--no-log-console)
+        exec > >(sed -u $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' >> "${DEPLOY_LOG_FILE}") 2>&1
     fi
-    if [[ "${LOG_FILE}" == "true" ]]; then
-        STREAM_ARGS+=(--log-file)
-    else
-        STREAM_ARGS+=(--no-log-file)
-    fi
-    "${BASH}" "$0" "${ORIG_ARGS[@]}" 2>&1 | ${PYTHON_BIN} "${SCRIPT_DIR}/config_utils.py" "${STREAM_ARGS[@]}"
-    exit "${PIPESTATUS[0]}"
+elif [[ "${LOG_CONSOLE}" == "false" ]]; then
+    exec >/dev/null 2>&1
 fi
 
 echo "=========================================================================="
@@ -200,10 +187,10 @@ echo "==========================================================================
 # ------------------------------------------------------------------------------
 if [[ -z "${MODEL_PATH}" ]]; then
     # Auto-detect latest compiled *.vmfb in models/torq/<timestamp>/ or models/torq/
-    MODEL_PATH=$(find models/torq models . -maxdepth 3 -name "torq_*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+    MODEL_PATH=$(find models/torq -maxdepth 2 -name "torq_*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
     MODEL_PATH="${MODEL_PATH#./}"
     if [[ -z "${MODEL_PATH}" ]]; then
-        MODEL_PATH=$(find models/torq models . -maxdepth 3 -name "*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+        MODEL_PATH=$(find models/torq -maxdepth 2 -name "*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
         MODEL_PATH="${MODEL_PATH#./}"
     fi
 fi
@@ -226,10 +213,8 @@ if [[ -z "${LABELS_PATH}" ]]; then
         LABELS_PATH="models/torq/torq_${CANDIDATE_NAME}.json"
     elif [[ -f "models/torq/labels.json" ]]; then
         LABELS_PATH="models/torq/labels.json"
-    elif [[ -f "models/torq_${CANDIDATE_BASE}.json" ]]; then
-        LABELS_PATH="models/torq_${CANDIDATE_BASE}.json"
     else
-        LATEST_LABELS=$(find models/torq models -maxdepth 3 -name "*.json" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+        LATEST_LABELS=$(find models/torq -maxdepth 2 -name "*.json" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
         if [[ -n "${LATEST_LABELS}" ]]; then
             LABELS_PATH="${LATEST_LABELS}"
         fi

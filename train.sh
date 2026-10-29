@@ -134,10 +134,13 @@ MODELS_BASE_DIR="${MODELS_DIR}/base"
 mkdir -p "${STAGING_ROOT}" "${MODELS_BASE_DIR}"
 
 # Logging options (both console and file enabled by default)
-LOG_CONSOLE="${FRIGATE_LOG_CONSOLE:-true}"
-LOG_FILE="${FRIGATE_LOG_FILE:-true}"
+LOG_CONSOLE="${FRIGATE_LOG_CONSOLE:-}"
+LOG_FILE="${FRIGATE_LOG_FILE:-}"
 LOG_DIR="${FRIGATE_LOG_DIR:-}"
-ORIG_ARGS=("$@")
+
+# Ensure terminal newline translation (onlcr) is active for left-aligned console output
+[[ -t 0 ]] && stty onlcr 2>/dev/null || true
+trap '[[ -t 0 ]] && stty onlcr 2>/dev/null || true' EXIT INT TERM
 
 # ------------------------------------------------------------------------------
 # Usage & Help
@@ -176,6 +179,8 @@ usage() {
     echo "  --coco-dataset NAME     COCO subset for co-training ('coco128' or 'coco-val2017')"
     echo "  --frigate-plus          Include Frigate+ dataset in training & validation splits"
     echo "  --no-frigate-plus       Exclude Frigate+ dataset from training splits"
+    echo "  --clean-images          Remove synced dataset images from remote Spark host after training"
+    echo "  --no-clean-images       Leave synced dataset images on remote Spark host after training"
     echo "  --extra-args ARGS       Forward extra arguments directly to 'yolo detect train'"
     echo "  -c, --config PATH       Path to YAML configuration file (default: config.yaml)"
     echo ""
@@ -200,6 +205,7 @@ EXPLICIT_DEVICE=false
 EXPLICIT_EPOCHS=false
 EXPLICIT_BASE_MODEL=false
 EXPLICIT_COCO=false
+EXPLICIT_CLEAN_IMAGES=false
 EXPLICIT_DEPLOY_HOST=false
 EXPLICIT_DEPLOY_DIR=false
 
@@ -242,6 +248,16 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-frigate-plus)
             USE_FRIGATE_PLUS="false"
+            shift
+            ;;
+        --clean-images)
+            CLEAN_IMAGES=true
+            EXPLICIT_CLEAN_IMAGES=true
+            shift
+            ;;
+        --no-clean-images)
+            CLEAN_IMAGES=false
+            EXPLICIT_CLEAN_IMAGES=true
             shift
             ;;
         --compile)
@@ -372,28 +388,25 @@ MODELS_LABELS_DIR="${MODELS_RUN_DIR}"
 MODELS_LOGS_DIR="${MODELS_RUN_DIR}/logs"
 mkdir -p "${MODELS_RUN_DIR}"
 
-if [[ -z "${FRIGATE_STREAM_LOGGING_ACTIVE:-}" ]]; then
-    export FRIGATE_STREAM_LOGGING_ACTIVE=1
-    export FRIGATE_LOG_CONSOLE="${LOG_CONSOLE}"
-    export FRIGATE_LOG_FILE="${LOG_FILE}"
-    if [[ "${LOG_FILE}" == "true" ]]; then
-        TARGET_LOG_DIR="${LOG_DIR:-${MODELS_LOGS_DIR}}"
-        export FRIGATE_LOG_DIR="$(python3 "${SCRIPT_DIR}/config_utils.py" --init-log-dir --log-dir "${TARGET_LOG_DIR}")"
-    fi
-    STREAM_ARGS=(--stream-log "train")
-    [[ -n "${FRIGATE_LOG_DIR:-}" ]] && STREAM_ARGS+=(--log-dir "${FRIGATE_LOG_DIR}")
+LOG_CONSOLE="${LOG_CONSOLE:-${PROFILE_LOG_CONSOLE:-true}}"
+LOG_FILE="${LOG_FILE:-${PROFILE_LOG_FILE:-true}}"
+TARGET_LOG_DIR="${LOG_DIR:-${MODELS_LOGS_DIR}}"
+
+export FRIGATE_BASH_LOGGING_ACTIVE=1
+export FRIGATE_LOG_CONSOLE="${LOG_CONSOLE}"
+export FRIGATE_LOG_FILE="${LOG_FILE}"
+
+if [[ "${LOG_FILE}" == "true" ]]; then
+    mkdir -p "${TARGET_LOG_DIR}"
+    export FRIGATE_LOG_DIR="$(cd "${TARGET_LOG_DIR}" && pwd)"
+    TRAIN_LOG_FILE="${FRIGATE_LOG_DIR}/train.log"
     if [[ "${LOG_CONSOLE}" == "true" ]]; then
-        STREAM_ARGS+=(--log-console)
+        exec > >(tee -a >(sed -u $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' >> "${TRAIN_LOG_FILE}")) 2>&1
     else
-        STREAM_ARGS+=(--no-log-console)
+        exec > >(sed -u $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' >> "${TRAIN_LOG_FILE}") 2>&1
     fi
-    if [[ "${LOG_FILE}" == "true" ]]; then
-        STREAM_ARGS+=(--log-file)
-    else
-        STREAM_ARGS+=(--no-log-file)
-    fi
-    "${BASH}" "$0" "${ORIG_ARGS[@]}" 2>&1 | python3 "${SCRIPT_DIR}/config_utils.py" "${STREAM_ARGS[@]}"
-    exit "${PIPESTATUS[0]}"
+elif [[ "${LOG_CONSOLE}" == "false" ]]; then
+    exec >/dev/null 2>&1
 fi
 
 log_info "Verifying local Python 3.12 environment..."
@@ -465,7 +478,9 @@ USE_FRIGATE_PLUS_PY="True"
 [[ -n "${PROFILE_WARMUP_EPOCHS}" ]] && WARMUP_EPOCHS="${PROFILE_WARMUP_EPOCHS}"
 [[ -n "${PROFILE_WARMUP_MOMENTUM}" ]] && WARMUP_MOMENTUM="${PROFILE_WARMUP_MOMENTUM}"
 [[ -n "${PROFILE_WARMUP_BIAS_LR}" ]] && WARMUP_BIAS_LR="${PROFILE_WARMUP_BIAS_LR}"
-[[ "${PROFILE_CLEAN_IMAGES:-false}" == "true" ]] && CLEAN_IMAGES=true
+if [[ "${EXPLICIT_CLEAN_IMAGES}" == "false" && "${PROFILE_CLEAN_IMAGES:-false}" == "true" ]]; then
+    CLEAN_IMAGES=true
+fi
 [[ -n "${PROFILE_REMOTE_DIR}" ]] && REMOTE_DIR="${PROFILE_REMOTE_DIR}"
 
 if [[ "${EXPLICIT_DEPLOY_HOST}" == "false" && -z "${DEPLOY_HOST}" && -n "${PROFILE_DEPLOY_HOST}" && "${TARGET_FORMAT}" == "torq" ]]; then
@@ -574,7 +589,7 @@ if [[ "${DO_EXPORT}" == "true" ]]; then
         EXPORT_CMD+=(--frigate-plus-dir "${FRIGATE_PLUS_DIR}")
     fi
     DATA_DIR="$(dirname "${DATA_YAML}")"
-    if [[ "${DATA_DIR}" != "." && "${DATA_DIR}" != "datasets" && "${DATA_DIR}" != "datasets/yolo" && "${DATA_DIR}" != "yolo_dataset" ]]; then
+    if [[ "${DATA_DIR}" != "." && "${DATA_DIR}" != "datasets" && "${DATA_DIR}" != "datasets/yolo" ]]; then
         EXPORT_CMD+=(--output-dir "${DATA_DIR}")
     fi
     log_info "Running: ${EXPORT_CMD[*]}"
@@ -673,7 +688,6 @@ elif [[ "${RUNNER}" == "spark" ]]; then
         [[ -f "${CONFIG_FILE}" ]] && SCRIPTS_TO_SYNC+=("${CONFIG_FILE}")
 
         LOCAL_YOLO_DIR="datasets/yolo"
-        [[ ! -d "${LOCAL_YOLO_DIR}" && -d "yolo_dataset" ]] && LOCAL_YOLO_DIR="yolo_dataset"
 
         if command -v rsync &>/dev/null; then
             rsync -avz --copy-links \
@@ -726,18 +740,19 @@ elif [[ "${RUNNER}" == "spark" ]]; then
             cd \"${REMOTE_DIR}\"
             source \"${REMOTE_DIR}/venv/bin/activate\"
             export PYTHONPATH=\"${REMOTE_DIR}:\${PYTHONPATH:-}\"
-            python3 -c \"import config_utils; config_utils.prepare_training_data_yaml('${COCO_DATASET}', '${REMOTE_DIR}', include_frigate_plus=${USE_FRIGATE_PLUS_PY}, frigate_plus_dir='${FRIGATE_PLUS_DIR}')\"
+            python3 -c 'import sys, config_utils; config_utils.prepare_training_data_yaml(sys.argv[1], sys.argv[2], include_frigate_plus=(sys.argv[3] == \"True\"), frigate_plus_dir=sys.argv[4])' \"${COCO_DATASET}\" \"${REMOTE_DIR}\" \"${USE_FRIGATE_PLUS_PY}\" \"${FRIGATE_PLUS_DIR}\"
         "
 
         # Launch training on Spark
         PREPROCESS_ELAPSED=$(( $(date +%s) - PREPROCESS_START_TS ))
         TRAIN_START_TS=$(date +%s)
         log_info "Launching YOLO fine-tuning on ${SPARK_HOST} (device=${DEVICE}, batch=${BATCH}, optimizer=${OPTIMIZER}, lr0=${LR0}, warmup=${WARMUP_EPOCHS})..."
-        ssh -t "${SPARK_HOST}" "
+        ssh "${SPARK_HOST}" "
             set -e
             cd \"${REMOTE_DIR}\"
             source \"${REMOTE_DIR}/venv/bin/activate\"
             export PYTHONPATH=\"${REMOTE_DIR}:\${PYTHONPATH:-}\"
+            export PYTHONUNBUFFERED=1
 
             START_MODEL='${BASE_MODEL}'
             if [ -f \"models/base/${BASE_MODEL}\" ]; then
@@ -803,15 +818,15 @@ elif [[ "${RUNNER}" == "spark" ]]; then
     # Clean remote images if requested
     if [[ "${CLEAN_IMAGES}" == "true" ]]; then
         log_info "Cleaning up remote training images on ${SPARK_HOST}..."
-        ssh "${SPARK_HOST}" "rm -rf \"${REMOTE_DIR}/datasets/yolo/images\" \"${REMOTE_DIR}/datasets/frigate-plus/images\" \"${REMOTE_DIR}/yolo_dataset/images\" \"${REMOTE_DIR}/datasets\"" || true
+        ssh "${SPARK_HOST}" "rm -rf \"${REMOTE_DIR}/datasets\"" || true
     fi
 
 else
     # --------------------------------------------------------------------------
     # Local GPU/CPU Training (Default)
     # --------------------------------------------------------------------------
-    if [[ ( "${DATA_YAML}" == "datasets/data.yaml" || "${DATA_YAML}" == "datasets/yolo/data.yaml" || "${DATA_YAML}" == "yolo_dataset/data.yaml" ) && ( -d "datasets/yolo/images/train" || -d "yolo_dataset/images/train" || -d "${FRIGATE_PLUS_DIR}/images/train" ) ]]; then
-        python3 -c "import config_utils; config_utils.prepare_training_data_yaml('${COCO_DATASET}', '.', include_frigate_plus=${USE_FRIGATE_PLUS_PY}, frigate_plus_dir='${FRIGATE_PLUS_DIR}')"
+    if [[ ( "${DATA_YAML}" == "datasets/data.yaml" || "${DATA_YAML}" == "datasets/yolo/data.yaml" ) && ( -d "datasets/yolo/images/train" || -d "${FRIGATE_PLUS_DIR}/images/train" ) ]]; then
+        python3 -c 'import sys, config_utils; config_utils.prepare_training_data_yaml(sys.argv[1], ".", include_frigate_plus=(sys.argv[2] == "True"), frigate_plus_dir=sys.argv[3])' "${COCO_DATASET}" "${USE_FRIGATE_PLUS_PY}" "${FRIGATE_PLUS_DIR}"
     fi
 
     if [[ ! -f "${DATA_YAML}" ]]; then
@@ -946,7 +961,7 @@ cp -f "${EXPORTED_ONNX}" "${OUTPUT_DIR}/best.onnx"
 if [[ "${TARGET_FORMAT}" == "nvidia" ]]; then
     mkdir -p "$(dirname "${OUTPUT_ONNX}")"
     cp -f "${EXPORTED_ONNX}" "${OUTPUT_ONNX}"
-    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}', target='${TARGET_FORMAT}', imgsz=${IMGSZ})"
+    python3 -c 'import sys; from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json(sys.argv[1], sys.argv[2], "", sys.argv[3], sys.argv[3], target=sys.argv[4], imgsz=int(sys.argv[5]))' "${DATA_YAML}" "${LABELS_FILE}" "${BASE_MODEL_NAME}" "${TARGET_FORMAT}" "${IMGSZ}"
     log_success "NVIDIA GPU ONNX model generated successfully: ${OUTPUT_ONNX} ($(du -h "${OUTPUT_ONNX}" | cut -f1))"
     log_info "Target is NVIDIA GPU ('${TARGET_FORMAT}'): skipping NPU quantization and compilation."
     PRIMARY_ARTIFACT="${OUTPUT_ONNX}"
@@ -963,7 +978,7 @@ elif [[ "${TARGET_FORMAT}" == "hailo" ]]; then
         --base-model-name "${BASE_MODEL_NAME}" \
         --target "${TARGET_FORMAT}"
 
-    NUM_CLASSES=$(python3 -c "import config_utils; print(len(config_utils.load_dataset_classes('${DATA_YAML}')))")
+    NUM_CLASSES=$(python3 -c 'import sys, config_utils; print(len(config_utils.load_dataset_classes(sys.argv[1])))' "${DATA_YAML}")
     log_info "Compiling ONNX to Hailo HEF via hailomz in ${HAILO_VENV_PATH:-active environment} (arch=${HW_ARCH}, classes=${NUM_CLASSES})..."
     (
         HMZ_YAML_ARG=()
@@ -1056,7 +1071,7 @@ else
     fi
 
     # Update labels with exact TFLite quantization scales/zero points
-    python3 -c "from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json('${DATA_YAML}', '${LABELS_FILE}', '${FULL_INT8_TFLITE}', '${BASE_MODEL_NAME}', '${BASE_MODEL_NAME}', target='${TARGET_FORMAT}')"
+    python3 -c 'import sys; from prepare_for_onnx2tf import step4_generate_labels_json; step4_generate_labels_json(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[4], target=sys.argv[5])' "${DATA_YAML}" "${LABELS_FILE}" "${FULL_INT8_TFLITE}" "${BASE_MODEL_NAME}" "${TARGET_FORMAT}"
 
     log_info "Converting TFLite to TOSA MLIR..."
     TOSA_MLIR="${OUTPUT_DIR}/${RUN_NAME_STEM}_normalized_full_integer.tosa.mlir"

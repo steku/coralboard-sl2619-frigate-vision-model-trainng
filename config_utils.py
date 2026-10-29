@@ -11,10 +11,12 @@ import json
 import logging
 import os
 from pathlib import Path
+import random
 import re
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import zipfile
 import yaml
 
 DEFAULT_CONFIG_FILES = [
@@ -119,18 +121,18 @@ def get_cvat_client(
 
 def load_dataset_classes(data_yaml_path: str = "datasets/data.yaml") -> Dict[int, str]:
     """
-    Load index-to-class-name mapping from a YOLO data.yaml or models/*.json / models/<timestamp>/labels/*.json.
+    Load index-to-class-name mapping from a YOLO data.yaml or models/<target>/*.json.
     """
     p = Path(data_yaml_path)
     if not p.is_file() and data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
-        for candidate in ("datasets/data.yaml", "datasets/yolo/data.yaml", "yolo_dataset/data.yaml"):
+        for candidate in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
             if Path(candidate).is_file():
                 p = Path(candidate)
                 break
 
     if not p.is_file():
         # Check fallback to models/<target>/*.json or models/<target>/<timestamp>/*.json only when using default dataset paths
-        if data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml", "yolo_dataset/data.yaml"):
+        if data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
             models_dir = Path("models")
             if models_dir.is_dir():
                 candidates = [
@@ -140,7 +142,7 @@ def load_dataset_classes(data_yaml_path: str = "datasets/data.yaml") -> Dict[int
                     models_dir / "nvidia" / "labels.json",
                     models_dir / "hailo" / "hailo_yolov8m.json",
                     models_dir / "hailo" / "labels.json",
-                ] + sorted(models_dir.glob("*/*/*.json")) + sorted(models_dir.glob("*/*.json")) + sorted(models_dir.glob("*.json"))
+                ] + sorted(models_dir.glob("*/*/*.json")) + sorted(models_dir.glob("*/*.json"))
                 for f in candidates:
                     if f.is_file():
                         try:
@@ -339,6 +341,16 @@ def get_frigate_plus_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, A
     }
 
 
+def safe_extract_zip(zf: zipfile.ZipFile, target_dir: Union[str, Path]) -> None:
+    """Safely extract a ZipFile while preventing path traversal (Zip Slip, CWE-22)."""
+    base_dir = Path(target_dir).resolve()
+    for member in zf.infolist():
+        member_path = (base_dir / member.filename).resolve()
+        if not member_path.is_relative_to(base_dir):
+            raise ValueError(f"Unsafe zip member path detected (path traversal blocked): {member.filename}")
+    zf.extractall(base_dir)
+
+
 def download_coco_dataset(dataset_name: str, target_dir: str = "datasets") -> Dict[str, str]:
     """
     Download and prepare a COCO dataset subset for co-training.
@@ -362,9 +374,8 @@ def download_coco_dataset(dataset_name: str, target_dir: str = "datasets") -> Di
             print(f"[INFO] COCO128 dataset already present at {ds_dir}")
         elif zip_candidate.is_file():
             print(f"[INFO] Extracting existing {zip_candidate}...")
-            import zipfile
             with zipfile.ZipFile(zip_candidate, "r") as zf:
-                zf.extractall(out_base)
+                safe_extract_zip(zf, out_base)
         else:
             print(f"[INFO] Downloading COCO128 dataset (~7 MB) into {out_base}...")
             url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/coco128.zip"
@@ -387,9 +398,8 @@ def download_coco_dataset(dataset_name: str, target_dir: str = "datasets") -> Di
             print(f"[INFO] COCO2017 labels already present at {val_lbl_dir}")
         elif lbl_zip_candidate.is_file():
             print(f"[INFO] Extracting existing {lbl_zip_candidate}...")
-            import zipfile
             with zipfile.ZipFile(lbl_zip_candidate, "r") as zf:
-                zf.extractall(out_base)
+                safe_extract_zip(zf, out_base)
         else:
             print(f"[INFO] Downloading COCO2017 YOLO labels (~46 MB) into {out_base}...")
             lbl_url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/coco2017labels.zip"
@@ -404,9 +414,8 @@ def download_coco_dataset(dataset_name: str, target_dir: str = "datasets") -> Di
             print(f"[INFO] COCO val2017 images already present at {val_img_dir}")
         elif val_zip_candidate.is_file():
             print(f"[INFO] Extracting existing {val_zip_candidate}...")
-            import zipfile
             with zipfile.ZipFile(val_zip_candidate, "r") as zf:
-                zf.extractall(ds_dir / "images")
+                safe_extract_zip(zf, ds_dir / "images")
         else:
             print(f"[INFO] Downloading COCO val2017 images (~800 MB, 5,000 images) into {ds_dir / 'images'}...")
             img_url = "http://images.cocodataset.org/zips/val2017.zip"
@@ -435,9 +444,9 @@ def prepare_training_data_yaml(
     """
     workspace = Path(workspace_dir).expanduser().resolve()
     target_datasets = workspace / "datasets"
-    yolo_dir = target_datasets / "yolo" if (target_datasets / "yolo").is_dir() or not (workspace / "yolo_dataset").is_dir() else (workspace / "yolo_dataset")
+    yolo_dir = target_datasets / "yolo"
     out_yaml = target_datasets / "data.yaml"
-    legacy_out_yaml = yolo_dir / "data.yaml"
+    yolo_out_yaml = yolo_dir / "data.yaml"
 
     cfg = load_config()
     if coco_dataset is None:
@@ -451,7 +460,7 @@ def prepare_training_data_yaml(
     fp_path = (workspace / frigate_plus_dir).resolve() if not Path(frigate_plus_dir).is_absolute() else Path(frigate_plus_dir)
 
     names = get_coco_80_dict()
-    for cand in (out_yaml, legacy_out_yaml, fp_path / "data.yaml", fp_path / "dataset.yaml"):
+    for cand in (out_yaml, yolo_out_yaml, fp_path / "data.yaml", fp_path / "dataset.yaml"):
         if cand.is_file():
             try:
                 with open(cand, "r", encoding="utf-8") as f:
@@ -513,7 +522,7 @@ def prepare_training_data_yaml(
 
     if yolo_dir.is_dir() and yolo_dir != target_datasets:
         try:
-            with open(legacy_out_yaml, "w", encoding="utf-8") as f:
+            with open(yolo_out_yaml, "w", encoding="utf-8") as f:
                 yaml.safe_dump(data_dict, f, sort_keys=False)
         except Exception:
             pass
@@ -695,40 +704,65 @@ def get_profile(
     }
 
 
+def _shell_quote(val: Any) -> str:
+    """Safely single-quote a string for POSIX shell eval without injection risk."""
+    return "'" + str(val).replace("'", "'\\''") + "'"
+
+
 def dump_profile_env(
     profile_name: Optional[str] = None,
     config_path: Optional[str] = None,
 ) -> str:
     """Generate shell assignment statements for train.sh eval."""
-    p = get_profile(profile_name, config_path=config_path)
+    cfg = load_config(config_path)
+    p = get_profile(profile_name, cfg=cfg, config_path=config_path)
+    log_s = get_logging_settings(cfg)
     lines = [
-        f"PROFILE_NAME='{p['name']}'",
-        f"PROFILE_TARGET='{p['target']}'",
-        f"PROFILE_REMOTE='{'true' if p['remote'] else 'false'}'",
-        f"PROFILE_HOST='{p['host']}'",
-        f"PROFILE_REMOTE_DIR='{p['remote_dir']}'",
-        f"PROFILE_DEVICE='{p['device']}'",
-        f"PROFILE_BATCH='{p['batch']}'",
-        f"PROFILE_WORKERS='{p['workers']}'",
-        f"PROFILE_CACHE='{p['cache']}'",
-        f"PROFILE_EPOCHS='{p['epochs']}'",
-        f"PROFILE_PATIENCE='{p['patience']}'",
-        f"PROFILE_BASE_MODEL='{p['base_model']}'",
-        f"PROFILE_IMGSZ='{p['imgsz']}'",
-        f"PROFILE_HW_ARCH='{p['hw_arch']}'",
-        f"PROFILE_COCO_DATASET='{p['coco_dataset']}'",
-        f"PROFILE_CLEAN_IMAGES='{'true' if p['clean_images'] else 'false'}'",
-        f"PROFILE_OPTIMIZER='{p['optimizer']}'",
-        f"PROFILE_LR0='{p['lr0']}'",
-        f"PROFILE_LRF='{p['lrf']}'",
-        f"PROFILE_COS_LR='{'True' if p['cos_lr'] else 'False'}'",
-        f"PROFILE_WARMUP_EPOCHS='{p['warmup_epochs']}'",
-        f"PROFILE_WARMUP_MOMENTUM='{p['warmup_momentum']}'",
-        f"PROFILE_WARMUP_BIAS_LR='{p['warmup_bias_lr']}'",
-        f"PROFILE_DEPLOY_HOST='{p['deploy_host']}'",
-        f"PROFILE_DEPLOY_DIR='{p['deploy_dir']}'",
-        f"PROFILE_FRIGATE_PLUS='{'true' if p['frigate_plus'] else 'false'}'",
-        f"PROFILE_FRIGATE_PLUS_DIR='{p['frigate_plus_dir']}'",
+        f"PROFILE_NAME={_shell_quote(p['name'])}",
+        f"PROFILE_TARGET={_shell_quote(p['target'])}",
+        f"PROFILE_REMOTE={_shell_quote('true' if p['remote'] else 'false')}",
+        f"PROFILE_HOST={_shell_quote(p['host'])}",
+        f"PROFILE_REMOTE_DIR={_shell_quote(p['remote_dir'])}",
+        f"PROFILE_DEVICE={_shell_quote(p['device'])}",
+        f"PROFILE_BATCH={_shell_quote(p['batch'])}",
+        f"PROFILE_WORKERS={_shell_quote(p['workers'])}",
+        f"PROFILE_CACHE={_shell_quote(p['cache'])}",
+        f"PROFILE_EPOCHS={_shell_quote(p['epochs'])}",
+        f"PROFILE_PATIENCE={_shell_quote(p['patience'])}",
+        f"PROFILE_BASE_MODEL={_shell_quote(p['base_model'])}",
+        f"PROFILE_IMGSZ={_shell_quote(p['imgsz'])}",
+        f"PROFILE_HW_ARCH={_shell_quote(p['hw_arch'])}",
+        f"PROFILE_COCO_DATASET={_shell_quote(p['coco_dataset'])}",
+        f"PROFILE_CLEAN_IMAGES={_shell_quote('true' if p['clean_images'] else 'false')}",
+        f"PROFILE_OPTIMIZER={_shell_quote(p['optimizer'])}",
+        f"PROFILE_LR0={_shell_quote(p['lr0'])}",
+        f"PROFILE_LRF={_shell_quote(p['lrf'])}",
+        f"PROFILE_COS_LR={_shell_quote('True' if p['cos_lr'] else 'False')}",
+        f"PROFILE_WARMUP_EPOCHS={_shell_quote(p['warmup_epochs'])}",
+        f"PROFILE_WARMUP_MOMENTUM={_shell_quote(p['warmup_momentum'])}",
+        f"PROFILE_WARMUP_BIAS_LR={_shell_quote(p['warmup_bias_lr'])}",
+        f"PROFILE_DEPLOY_HOST={_shell_quote(p['deploy_host'])}",
+        f"PROFILE_DEPLOY_DIR={_shell_quote(p['deploy_dir'])}",
+        f"PROFILE_FRIGATE_PLUS={_shell_quote('true' if p['frigate_plus'] else 'false')}",
+        f"PROFILE_FRIGATE_PLUS_DIR={_shell_quote(p['frigate_plus_dir'])}",
+        f"PROFILE_LOG_CONSOLE={_shell_quote('true' if log_s['console'] else 'false')}",
+        f"PROFILE_LOG_FILE={_shell_quote('true' if log_s['file'] else 'false')}",
+    ]
+    return "\n".join(lines)
+
+
+def dump_deploy_env(config_path: Optional[str] = None) -> str:
+    """Generate shell assignment statements for deploy_to_coralboard.sh eval."""
+    cfg = load_config(config_path)
+    dep = cfg.get("deployment", {}) if isinstance(cfg.get("deployment"), dict) else {}
+    log_s = get_logging_settings(cfg)
+    lines = [
+        f"CFG_HOST={_shell_quote(dep.get('host') or '')}",
+        f"CFG_DIR={_shell_quote(dep.get('dir') or '')}",
+        f"CFG_RESTART={_shell_quote('true' if dep.get('restart_service') else 'false')}",
+        f"CFG_SERVICE={_shell_quote(dep.get('service_name') or '')}",
+        f"CFG_LOG_CONSOLE={_shell_quote('true' if log_s['console'] else 'false')}",
+        f"CFG_LOG_FILE={_shell_quote('true' if log_s['file'] else 'false')}",
     ]
     return "\n".join(lines)
 
@@ -837,6 +871,180 @@ def collect_coco_pairs(
                 pairs.append((img_path, lbl_path))
 
     return pairs
+
+
+def add_accuracy_benchmark_args(
+    parser: argparse.ArgumentParser,
+    default_ds: str = "./datasets/yolo",
+) -> None:
+    """Register shared dataset/evaluation CLI arguments for accuracy benchmark scripts."""
+    cfg = load_config()
+    default_coco_ds = cfg.get("coco", {}).get("dataset", "coco-val2017")
+    default_fp_dir = cfg.get("frigate_plus", {}).get("path", "./datasets/frigate-plus")
+
+    parser.add_argument(
+        "--dataset-dir",
+        default=default_ds,
+        help=f"Path to YOLO dataset directory containing images/ and labels/ (default: {default_ds})",
+    )
+    parser.add_argument(
+        "--split",
+        choices=["all", "val", "train"],
+        default="all",
+        help="Dataset split to evaluate (default: all - draws from entire dataset)",
+    )
+    parser.add_argument(
+        "--num-images",
+        type=int,
+        default=60,
+        help="Number of random images to test (default: 60, set 0 or use --all for all images)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Evaluate all images in the selected dataset split.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for repeatable sampling (default: 42)",
+    )
+    parser.add_argument(
+        "--threshold",
+        dest="threshold",
+        type=float,
+        default=0.20,
+        help="Confidence score threshold for detections (default: 0.20)",
+    )
+    parser.add_argument(
+        "--iou-threshold",
+        type=float,
+        default=0.45,
+        help="Intersection-over-Union (IoU) threshold for matching boxes (default: 0.45)",
+    )
+    parser.add_argument(
+        "--output-json",
+        dest="output_json",
+        default=None,
+        help="Optional path to export evaluation report as JSON",
+    )
+    parser.add_argument(
+        "--coco-images",
+        dest="coco_images",
+        type=int,
+        default=0,
+        help="Number of random COCO dataset images to include in benchmark (default: 0)",
+    )
+    parser.add_argument(
+        "--coco-dataset",
+        default=default_coco_ds,
+        choices=["coco-val2017", "coco128"],
+        help=f"COCO dataset subset for benchmark images (default: {default_coco_ds})",
+    )
+    parser.add_argument(
+        "--datasets-dir",
+        default="./datasets",
+        help="Base directory containing downloaded COCO datasets (default: ./datasets)",
+    )
+    parser.add_argument(
+        "--frigate-plus-images",
+        dest="frigate_plus_images",
+        type=int,
+        default=0,
+        help="Number of random Frigate+ dataset images to include in benchmark (default: 0)",
+    )
+    parser.add_argument(
+        "--frigate-plus-dir",
+        default=default_fp_dir,
+        help=f"Directory containing Frigate+ dataset (default: {default_fp_dir})",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Print detailed per-image detection results",
+    )
+
+
+def sample_evaluation_pairs(
+    args: argparse.Namespace,
+    dataset_dir: Path,
+    collect_dataset_pairs_fn: Callable[[Union[str, Path], str], List[Tuple[Path, Path]]] = collect_dataset_pairs,
+    collect_coco_pairs_fn: Callable[[str, str], List[Tuple[Path, Path]]] = collect_coco_pairs,
+) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]], List[Tuple[Path, Path]], List[Tuple[Path, Path]], str]:
+    """
+    Collect and sample image/label pairs across local YOLO, external COCO, and Frigate+ datasets.
+    Returns (selected_pairs, yolo_selected, coco_selected, fp_selected, target_split).
+    """
+    coco_images_req = getattr(args, "coco_images", 0)
+    coco_dataset_name = getattr(args, "coco_dataset", "coco-val2017")
+    datasets_dir = getattr(args, "datasets_dir", "./datasets")
+    frigate_plus_images_req = getattr(args, "frigate_plus_images", 0)
+    frigate_plus_dir = Path(getattr(args, "frigate_plus_dir", "./datasets/frigate-plus")).resolve()
+    target_split = args.split
+
+    pairs = collect_dataset_pairs_fn(dataset_dir, target_split) if dataset_dir.is_dir() else []
+    if not pairs and coco_images_req <= 0 and frigate_plus_images_req <= 0:
+        print(f"[ERROR] No image/label pairs found in {dataset_dir} for split '{target_split}'.")
+        sys.exit(1)
+
+    random.seed(args.seed)
+    yolo_selected: List[Tuple[Path, Path]] = []
+    if pairs:
+        if not args.all and args.num_images > len(pairs):
+            all_pairs = collect_dataset_pairs_fn(dataset_dir, "all")
+            if target_split == "val" and len(all_pairs) > len(pairs):
+                print(f"[WARN] Split '{target_split}' only contains {len(pairs)} images, but {args.num_images} were requested.")
+                print(f"[INFO] Automatically expanding to '--split all' ({len(all_pairs)} images total) to evaluate the requested {args.num_images} images.")
+                pairs = all_pairs
+                target_split = "all"
+            else:
+                print(f"[WARN] Requested {args.num_images} images, but split '{target_split}' only contains {len(pairs)} images.")
+                print(f"[INFO] Evaluating all {len(pairs)} available images in '{target_split}'.")
+
+        print(f"[INFO] Discovered {len(pairs)} candidate images in split '{target_split}'.")
+        if args.all:
+            yolo_selected = pairs
+        elif args.num_images > 0:
+            yolo_selected = pairs if args.num_images >= len(pairs) else random.sample(pairs, args.num_images)
+        elif args.num_images == 0 and coco_images_req <= 0 and frigate_plus_images_req <= 0:
+            yolo_selected = pairs
+
+    coco_selected: List[Tuple[Path, Path]] = []
+    if coco_images_req > 0:
+        coco_pairs = collect_coco_pairs_fn(coco_dataset_name, datasets_dir)
+        if not coco_pairs:
+            print(f"[WARN] No valid image/label pairs found in COCO dataset '{coco_dataset_name}'.")
+        else:
+            print(f"[INFO] Discovered {len(coco_pairs)} candidate images in COCO dataset '{coco_dataset_name}'.")
+            coco_rng = random.Random(args.seed + 1000)
+            coco_selected = coco_pairs if coco_images_req >= len(coco_pairs) else coco_rng.sample(coco_pairs, coco_images_req)
+
+    fp_selected: List[Tuple[Path, Path]] = []
+    if frigate_plus_images_req > 0:
+        if not frigate_plus_dir.is_dir():
+            print(f"[WARN] Frigate+ dataset directory not found at: {frigate_plus_dir}")
+        else:
+            fp_pairs = collect_dataset_pairs_fn(frigate_plus_dir, target_split)
+            if not fp_pairs and target_split != "all":
+                all_fp_pairs = collect_dataset_pairs_fn(frigate_plus_dir, "all")
+                if all_fp_pairs:
+                    print(f"[INFO] Split '{target_split}' empty in Frigate+, using 'all' ({len(all_fp_pairs)} images).")
+                    fp_pairs = all_fp_pairs
+            if not fp_pairs:
+                print(f"[WARN] No valid image/label pairs found in Frigate+ dataset at '{frigate_plus_dir}'.")
+            else:
+                print(f"[INFO] Discovered {len(fp_pairs)} candidate images in Frigate+ dataset '{frigate_plus_dir.name}'.")
+                fp_rng = random.Random(args.seed + 2000)
+                fp_selected = fp_pairs if frigate_plus_images_req >= len(fp_pairs) else fp_rng.sample(fp_pairs, frigate_plus_images_req)
+
+    selected_pairs = yolo_selected + coco_selected + fp_selected
+    if not selected_pairs:
+        print("[ERROR] No images selected for evaluation. Please adjust --num-images, --coco-images, or --frigate-plus-images.")
+        sys.exit(1)
+
+    return selected_pairs, yolo_selected, coco_selected, fp_selected, target_split
 
 
 def parse_ground_truth(
@@ -1114,8 +1322,6 @@ def get_logging_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         default=True,
     )
     base_dir = str(log_cfg.get("base_dir") or "models")
-    if base_dir.rstrip("/").endswith("models/logs"):
-        base_dir = base_dir.rstrip("/")[:-5] or "models"
 
     return {
         "console": console,
@@ -1162,8 +1368,6 @@ def resolve_log_dir(
             if not b_dir.is_absolute():
                 b_dir = repo_root / b_dir
             root_models = b_dir.resolve()
-            if root_models.name == "logs":
-                root_models = root_models.parent if root_models.parent.name == "models" else (repo_root / "models")
             resolved = root_models / resolved_target / timestamp / "logs"
         else:
             if base_dir is not None:
@@ -1240,7 +1444,7 @@ def setup_logging(
     global _ACTIVE_LOGGER
 
     settings = get_logging_settings()
-    if log_to_console is None and os.getenv("FRIGATE_STREAM_LOGGING_ACTIVE") == "1" and intercept_print:
+    if log_to_console is None and os.getenv("FRIGATE_BASH_LOGGING_ACTIVE") == "1":
         use_console = True
     else:
         use_console = settings["console"] if log_to_console is None else bool(log_to_console)
@@ -1332,59 +1536,18 @@ def setup_logging_from_args(
     )
 
 
-def stream_stdin_to_logger(
-    script_name: str,
-    log_to_console: Optional[bool] = None,
-    log_to_file: Optional[bool] = None,
-    log_dir: Optional[Union[str, Path]] = None,
-    target: Optional[str] = None,
-) -> None:
-    """Read lines from stdin (e.g. from bash scripts) and log them via Python's logging library."""
-    logger = setup_logging(
-        script_name=script_name,
-        log_to_console=log_to_console,
-        log_to_file=log_to_file,
-        log_dir=log_dir,
-        target=target,
-        intercept_print=False,
-    )
-    try:
-        while True:
-            raw_line = sys.stdin.readline()
-            if not raw_line:
-                break
-            line = raw_line.rstrip("\r\n")
-            lvl = _infer_log_level(line)
-            logger.log(lvl, line)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        logging.shutdown()
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Configuration profile & logging CLI utility")
+    parser = argparse.ArgumentParser(description="Configuration profile & metrics CLI utility")
     parser.add_argument("--profile-env", nargs="?", const="", default=None, help="Output shell env assignments for profile")
+    parser.add_argument("--deploy-env", action="store_true", help="Output shell env assignments for deployment config")
     parser.add_argument("--checkpoint-metrics", default=None, help="Output formatted mAP50 and mAP50-95 report for a .pt checkpoint")
-    parser.add_argument("--init-log-dir", action="store_true", help="Create and print a new timestamped log directory")
-    parser.add_argument("--stream-log", default=None, metavar="SCRIPT_NAME", help="Stream stdin through Python logging library")
-    parser.add_argument("--target", default=None, help="Optional target (torq, nvidia, hailo) for log directory resolution")
     parser.add_argument("--config", "-c", default=None, help="Path to config.yaml")
-    add_logging_args(parser)
     args = parser.parse_args()
 
-    if args.stream_log is not None:
-        stream_stdin_to_logger(
-            script_name=args.stream_log,
-            log_to_console=args.log_console,
-            log_to_file=args.log_file,
-            log_dir=args.log_dir,
-            target=args.target,
-        )
-    elif args.init_log_dir:
-        _ORIG_PRINT(str(resolve_log_dir(log_dir=args.log_dir, target=args.target, create=True)))
-    elif args.checkpoint_metrics is not None:
+    if args.checkpoint_metrics is not None:
         _ORIG_PRINT(format_checkpoint_metrics_report(args.checkpoint_metrics))
+    elif args.deploy_env:
+        _ORIG_PRINT(dump_deploy_env(args.config))
     elif args.profile_env is not None:
         prof_arg = args.profile_env if args.profile_env else None
         try:

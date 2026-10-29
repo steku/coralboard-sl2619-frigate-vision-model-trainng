@@ -37,8 +37,6 @@ def find_default_model() -> str:
         Path("models/nvidia/nvidia_yolov9s.onnx"),
         Path("staging/yolov9s/best_normalized_output.onnx"),
         Path("staging/yolov9s/best.onnx"),
-        Path("staging/best_normalized_output.onnx"),
-        Path("staging/best.onnx"),
     ]
     for c in candidates:
         if c.is_file():
@@ -52,9 +50,6 @@ def find_default_model() -> str:
         onnx_files = sorted(models_dir.glob("nvidia/nvidia_*.onnx"), key=lambda p: p.stat().st_mtime)
         if onnx_files:
             return str(onnx_files[-1])
-        onnx_files = sorted(models_dir.glob("*/*/*.onnx"), key=lambda p: p.stat().st_mtime)
-        if onnx_files:
-            return str(onnx_files[-1])
 
     staging_dir = Path("staging")
     if staging_dir.is_dir():
@@ -64,17 +59,12 @@ def find_default_model() -> str:
 
     if Path("models/base/yolov9s.pt").is_file():
         return "models/base/yolov9s.pt"
-    if Path("yolov9s.pt").is_file():
-        return "yolov9s.pt"
 
     return "models/nvidia/nvidia_yolov9s.onnx"
 
 
 def parse_args():
     default_model = find_default_model()
-    default_ds = "./datasets/yolo"
-    default_coco_ds = config_utils.load_config().get("coco", {}).get("dataset", "coco-val2017")
-    default_fp_dir = config_utils.load_config().get("frigate_plus", {}).get("path", "./datasets/frigate-plus")
 
     parser = argparse.ArgumentParser(
         description="Benchmark detection accuracy and inference latency for NVIDIA ONNX and PyTorch models.",
@@ -97,94 +87,12 @@ def parse_args():
         default=320,
         help="Inference image resolution (default: 320)",
     )
-    parser.add_argument(
-        "--dataset-dir",
-        default=default_ds,
-        help=f"Path to YOLO dataset directory containing images/ and labels/ (default: {default_ds})",
-    )
-    parser.add_argument(
-        "--split",
-        choices=["all", "val", "train"],
-        default="all",
-        help="Dataset split to evaluate (default: all - draws from entire dataset)",
-    )
-    parser.add_argument(
-        "--num-images",
-        type=int,
-        default=60,
-        help="Number of random dataset images to test (default: 60, set 0 or use --all for all images)",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Evaluate all images in the selected dataset split.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for repeatable sampling (default: 42)",
-    )
-    parser.add_argument(
-        "--threshold",
-        dest="threshold",
-        type=float,
-        default=0.20,
-        help="Confidence score threshold for detections (default: 0.20)",
-    )
-    parser.add_argument(
-        "--iou-threshold",
-        type=float,
-        default=0.45,
-        help="Intersection-over-Union (IoU) threshold for matching boxes (default: 0.45)",
-    )
-    parser.add_argument(
-        "--output-json",
-        dest="output_json",
-        default=None,
-        help="Optional path to export evaluation report as JSON",
-    )
-    parser.add_argument(
-        "--coco-images",
-        dest="coco_images",
-        type=int,
-        default=0,
-        help="Number of random COCO dataset images to include in benchmark (default: 0)",
-    )
-    parser.add_argument(
-        "--coco-dataset",
-        default=default_coco_ds,
-        choices=["coco-val2017", "coco128"],
-        help=f"COCO dataset subset for benchmark images (default: {default_coco_ds})",
-    )
-    parser.add_argument(
-        "--datasets-dir",
-        default="./datasets",
-        help="Base directory containing downloaded COCO datasets (default: ./datasets)",
-    )
-    parser.add_argument(
-        "--frigate-plus-images",
-        dest="frigate_plus_images",
-        type=int,
-        default=0,
-        help="Number of random Frigate+ dataset images to include in benchmark (default: 0)",
-    )
-    parser.add_argument(
-        "--frigate-plus-dir",
-        default=default_fp_dir,
-        help=f"Directory containing Frigate+ dataset (default: {default_fp_dir})",
-    )
+    config_utils.add_accuracy_benchmark_args(parser, default_ds="./datasets/yolo")
     parser.add_argument(
         "--labels",
         dest="labels_path",
         default=None,
         help="Optional path to custom labels.json metadata file",
-    )
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Print detailed per-image detection results",
     )
     config_utils.add_logging_args(parser)
     return parser.parse_args()
@@ -207,7 +115,6 @@ def load_class_names(dataset_dir: Path, labels_path: Optional[str] = None) -> Di
     for candidate in [
         Path("models/nvidia/nvidia_yolov9s.json"),
         Path("models/nvidia/labels.json"),
-        Path("labels.json"),
         dataset_dir / "data.yaml",
         Path("datasets/data.yaml"),
     ]:
@@ -266,69 +173,13 @@ def evaluate(args):
         sys.exit(1)
 
     dataset_dir = Path(args.dataset_dir).resolve()
-    coco_images_req = getattr(args, "coco_images", 0)
-    coco_dataset_name = getattr(args, "coco_dataset", "coco-val2017")
-    datasets_dir = getattr(args, "datasets_dir", "./datasets")
-    frigate_plus_images_req = getattr(args, "frigate_plus_images", 0)
-    frigate_plus_dir = Path(getattr(args, "frigate_plus_dir", "./datasets/frigate-plus")).resolve()
-
     class_names = load_class_names(dataset_dir, args.labels_path)
-    target_split = args.split
-
-    pairs = []
-    if dataset_dir.is_dir():
-        pairs = collect_dataset_pairs(dataset_dir, target_split)
-
-    if not pairs and coco_images_req <= 0 and frigate_plus_images_req <= 0:
-        print(f"[ERROR] No image/label pairs found in {dataset_dir} for split '{target_split}'.")
-        sys.exit(1)
-
-    # 1. Sample local YOLO dataset
-    random.seed(args.seed)
-    yolo_selected = []
-    if pairs:
-        if not args.all and args.num_images > len(pairs):
-            all_pairs = collect_dataset_pairs(dataset_dir, "all")
-            if target_split == "val" and len(all_pairs) > len(pairs):
-                print(f"[WARN] Split '{target_split}' has {len(pairs)} images, but {args.num_images} requested.")
-                print(f"[INFO] Expanding to '--split all' ({len(all_pairs)} images) to satisfy request.")
-                pairs = all_pairs
-                target_split = "all"
-
-        if args.all:
-            yolo_selected = pairs
-        elif args.num_images > 0:
-            yolo_selected = pairs if args.num_images >= len(pairs) else random.sample(pairs, args.num_images)
-        elif args.num_images == 0 and coco_images_req <= 0 and frigate_plus_images_req <= 0:
-            yolo_selected = pairs
-
-    # 2. Sample external COCO images
-    coco_selected = []
-    if coco_images_req > 0:
-        coco_pairs = collect_coco_pairs(coco_dataset_name, datasets_dir=datasets_dir)
-        if not coco_pairs:
-            print(f"[WARN] No images available in COCO dataset '{coco_dataset_name}'.")
-        else:
-            coco_rng = random.Random(args.seed + 1000)
-            coco_selected = coco_pairs if coco_images_req >= len(coco_pairs) else coco_rng.sample(coco_pairs, coco_images_req)
-
-    # 3. Sample Frigate+ images
-    fp_selected = []
-    if frigate_plus_images_req > 0:
-        if not frigate_plus_dir.is_dir():
-            print(f"[WARN] Frigate+ dataset directory not found at: {frigate_plus_dir}")
-        else:
-            fp_pairs = collect_dataset_pairs(frigate_plus_dir, target_split)
-            if not fp_pairs:
-                print(f"[WARN] No images found in Frigate+ directory: {frigate_plus_dir}")
-            else:
-                fp_rng = random.Random(args.seed + 2000)
-                fp_selected = fp_pairs if frigate_plus_images_req >= len(fp_pairs) else fp_rng.sample(fp_pairs, frigate_plus_images_req)
-
-    selected_pairs = yolo_selected + coco_selected + fp_selected
-    if not selected_pairs:
-        print("[ERROR] No images selected for evaluation.")
-        sys.exit(1)
+    selected_pairs, yolo_selected, coco_selected, fp_selected, target_split = config_utils.sample_evaluation_pairs(
+        args,
+        dataset_dir,
+        collect_dataset_pairs_fn=collect_dataset_pairs,
+        collect_coco_pairs_fn=collect_coco_pairs,
+    )
 
     resolved_device = resolve_execution_device(str(model_path), args.device)
     print("=" * 90)
