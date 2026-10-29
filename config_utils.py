@@ -985,14 +985,77 @@ def summarize_class_metrics(
     return overall_summary, class_report_data, sorted_classes
 
 
+def get_checkpoint_metrics(weights_path: Union[str, Path]) -> Dict[str, Optional[float]]:
+    """Extract mAP50 and mAP50-95 validation metrics from a YOLO .pt checkpoint or sibling results.csv."""
+    result: Dict[str, Optional[float]] = {"map50": None, "map50_95": None}
+    if not weights_path:
+        return result
+
+    p = Path(weights_path)
+    if p.is_file():
+        try:
+            import torch
+            ckpt = torch.load(str(p), map_location="cpu", weights_only=False)
+            if isinstance(ckpt, dict):
+                tm = ckpt.get("train_metrics") or {}
+                if isinstance(tm, dict):
+                    m50 = tm.get("metrics/mAP50(B)", tm.get("mAP50"))
+                    m50_95 = tm.get("metrics/mAP50-95(B)", tm.get("mAP50-95"))
+                    if m50 is not None:
+                        result["map50"] = float(m50)
+                    if m50_95 is not None:
+                        result["map50_95"] = float(m50_95)
+        except Exception:
+            pass
+
+    if (result["map50"] is None or result["map50_95"] is None) and p.parent.parent.is_dir():
+        csv_path = p.parent.parent / "results.csv"
+        if csv_path.is_file():
+            try:
+                import csv
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    rows = list(csv.DictReader(f))
+                if rows:
+                    clean_rows = [{k.strip(): v.strip() for k, v in r.items() if k} for r in rows]
+                    best_row = max(
+                        clean_rows,
+                        key=lambda r: float(r.get("metrics/mAP50-95(B)", 0.0) or 0.0),
+                    )
+                    if result["map50"] is None and "metrics/mAP50(B)" in best_row:
+                        result["map50"] = float(best_row["metrics/mAP50(B)"])
+                    if result["map50_95"] is None and "metrics/mAP50-95(B)" in best_row:
+                        result["map50_95"] = float(best_row["metrics/mAP50-95(B)"])
+            except Exception:
+                pass
+
+    return result
+
+
+def format_checkpoint_metrics_report(weights_path: Union[str, Path]) -> str:
+    """Format mAP50 and mAP50-95 metrics for train.sh completion report."""
+    metrics = get_checkpoint_metrics(weights_path)
+    m50 = metrics.get("map50")
+    m50_95 = metrics.get("map50_95")
+    m50_str = f"{m50:.4f} ({m50 * 100.0:.2f}%)" if m50 is not None else "N/A"
+    m50_95_str = f"{m50_95:.4f} ({m50_95 * 100.0:.2f}%)" if m50_95 is not None else "N/A"
+    return (
+        f"Model Metrics ({Path(weights_path).name if weights_path else 'best.pt'}):\n"
+        f"  mAP50          : {m50_str}\n"
+        f"  mAP50-95       : {m50_95_str}"
+    )
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Configuration profile CLI utility")
     parser.add_argument("--profile-env", nargs="?", const="", default=None, help="Output shell env assignments for profile")
+    parser.add_argument("--checkpoint-metrics", default=None, help="Output formatted mAP50 and mAP50-95 report for a .pt checkpoint")
     parser.add_argument("--config", "-c", default=None, help="Path to config.yaml")
     args = parser.parse_args()
 
-    if args.profile_env is not None:
+    if args.checkpoint_metrics is not None:
+        print(format_checkpoint_metrics_report(args.checkpoint_metrics))
+    elif args.profile_env is not None:
         import sys
         prof_arg = args.profile_env if args.profile_env else None
         try:

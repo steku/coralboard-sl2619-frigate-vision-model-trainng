@@ -638,16 +638,18 @@ Every compilation run generates timestamped artifacts (`<target>_<model>_<YYMMDD
 - **Label Maps (`models/labels/`)**:
   - `<target>_<model>_<YYMMDD-HHMM>.{json,txt}` $\rightarrow$ symlinked as `<target>_<model>.{json,txt}` and `labels.{json,txt}`
 
-At the completion of `train.sh`, a **Pipeline Timing Summary** report is printed:
+At the completion of `train.sh`, a **Model Metrics & Timing Summary** report is printed:
 ```text
-==========================================================================
-  PIPELINE TIMING SUMMARY
-==========================================================================
-  Preprocessing  : 0m 12s  (Config, dataset prep & pre-training sync)
-  Training       : 14m 28s  (YOLO model training execution)
-  Postprocessing : 3m 45s  (Export, quantization, compilation & deploy)
 --------------------------------------------------------------------------
-  Total Time     : 18m 25s
+Model Metrics (best.pt):
+  mAP50          : 0.8910 (89.10%)
+  mAP50-95       : 0.7001 (70.01%)
+--------------------------------------------------------------------------
+Timing Summary:
+  Preprocessing  : 12s
+  Training       : 14m 28s (868s)
+  Postprocessing : 3m 45s (225s)
+  Total Time     : 18m 25s (1105s)
 ==========================================================================
 ```
 

@@ -41,6 +41,10 @@ format_duration() {
 
 print_timing_report() {
     local total_elapsed=$((PREPROCESS_ELAPSED + TRAINING_ELAPSED + POSTPROCESS_ELAPSED))
+    if [[ -n "${WEIGHTS_PATH:-}" && -f "${WEIGHTS_PATH}" ]]; then
+        python3 config_utils.py --checkpoint-metrics "${WEIGHTS_PATH}" 2>/dev/null || true
+        echo "--------------------------------------------------------------------------"
+    fi
     echo "Timing Summary:"
     echo "  Preprocessing  : $(format_duration "${PREPROCESS_ELAPSED}")"
     echo "  Training       : $(format_duration "${TRAINING_ELAPSED}")"

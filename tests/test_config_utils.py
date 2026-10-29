@@ -389,4 +389,42 @@ def test_shared_evaluation_helpers(tmp_path):
     assert sorted_cls[0] == "person"
 
 
+def test_get_and_format_checkpoint_metrics(tmp_path):
+    import torch
+
+    weights_dir = tmp_path / "runs" / "exp1" / "weights"
+    weights_dir.mkdir(parents=True)
+    pt_file = weights_dir / "best.pt"
+
+    torch.save(
+        {
+            "train_metrics": {
+                "metrics/mAP50(B)": 0.89101,
+                "metrics/mAP50-95(B)": 0.7001,
+            }
+        },
+        pt_file,
+    )
+
+    metrics = config_utils.get_checkpoint_metrics(pt_file)
+    assert pytest.approx(metrics["map50"], rel=1e-4) == 0.89101
+    assert pytest.approx(metrics["map50_95"], rel=1e-4) == 0.7001
+
+    report_str = config_utils.format_checkpoint_metrics_report(pt_file)
+    assert "Model Metrics (best.pt):" in report_str
+    assert "0.8910 (89.10%)" in report_str
+    assert "0.7001 (70.01%)" in report_str
+
+    # Test results.csv fallback when checkpoint has no train_metrics
+    pt_no_metrics = weights_dir / "last.pt"
+    torch.save({"epoch": 10}, pt_no_metrics)
+    csv_file = weights_dir.parent / "results.csv"
+    csv_file.write_text("epoch, metrics/mAP50(B), metrics/mAP50-95(B)\n1, 0.7500, 0.5200\n2, 0.8250, 0.6125\n")
+
+    fallback_metrics = config_utils.get_checkpoint_metrics(pt_no_metrics)
+    assert pytest.approx(fallback_metrics["map50"], rel=1e-4) == 0.8250
+    assert pytest.approx(fallback_metrics["map50_95"], rel=1e-4) == 0.6125
+
+
+
 
