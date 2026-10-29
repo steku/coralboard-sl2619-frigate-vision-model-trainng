@@ -714,6 +714,7 @@ def parse_args():
         default=defaults["upload_only"],
         help="Skip downloading from Frigate; upload existing local dataset directly to CVAT.",
     )
+    config_utils.add_logging_args(parser)
 
     args = parser.parse_args()
 
@@ -1244,6 +1245,7 @@ def upload_to_cvat(cvat_url, cvat_user, cvat_pass, output_dir, task_name=None, c
 
 def main():
     args = parse_args()
+    config_utils.setup_logging_from_args(args, "frigate-to-cvat")
 
     if args.no_upload and args.upload_only:
         print("[ERROR] Cannot specify both --no-upload and --upload-only.")

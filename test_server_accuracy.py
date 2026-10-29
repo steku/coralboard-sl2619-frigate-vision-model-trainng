@@ -133,6 +133,7 @@ def parse_args():
         action="store_true",
         help="Print detailed per-image detection results",
     )
+    config_utils.add_logging_args(parser)
     return parser.parse_args()
 
 
@@ -509,6 +510,7 @@ def run_accuracy_benchmark(
 
 def main():
     args = parse_args()
+    config_utils.setup_logging_from_args(args, "test_server_accuracy")
     evaluate(args)
 
 

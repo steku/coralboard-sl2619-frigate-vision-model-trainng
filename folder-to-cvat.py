@@ -196,11 +196,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Scan images and parse labels without uploading to CVAT",
     )
+    config_utils.add_logging_args(parser)
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
+    config_utils.setup_logging_from_args(args, "folder-to-cvat")
 
     # 1. Folder validation
     folder_path = Path(args.folder).resolve()

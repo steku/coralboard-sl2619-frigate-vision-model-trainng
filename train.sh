@@ -127,12 +127,18 @@ USE_FRIGATE_PLUS=""
 FRIGATE_PLUS_DIR="datasets/frigate-plus"
 
 # Output directories
+TIMESTAMP="${FRIGATE_RUN_TIMESTAMP:-$(date +%y%m%d-%H%M)}"
+export FRIGATE_RUN_TIMESTAMP="${TIMESTAMP}"
 OUTPUT_DIR="output"
 MODELS_DIR="models"
-MODELS_COMPILED_DIR="${MODELS_DIR}/compiled"
 MODELS_BASE_DIR="${MODELS_DIR}/base"
-MODELS_LABELS_DIR="${MODELS_DIR}/labels"
-mkdir -p "${OUTPUT_DIR}" "${MODELS_COMPILED_DIR}" "${MODELS_LABELS_DIR}" "${MODELS_BASE_DIR}"
+mkdir -p "${OUTPUT_DIR}" "${MODELS_BASE_DIR}"
+
+# Logging options (both console and file enabled by default)
+LOG_CONSOLE="${FRIGATE_LOG_CONSOLE:-true}"
+LOG_FILE="${FRIGATE_LOG_FILE:-true}"
+LOG_DIR="${FRIGATE_LOG_DIR:-}"
+ORIG_ARGS=("$@")
 
 # ------------------------------------------------------------------------------
 # Usage & Help
@@ -173,6 +179,13 @@ usage() {
     echo "  --no-frigate-plus       Exclude Frigate+ dataset from training splits"
     echo "  --extra-args ARGS       Forward extra arguments directly to 'yolo detect train'"
     echo "  -c, --config PATH       Path to YAML configuration file (default: config.yaml)"
+    echo ""
+    echo "Logging Options:"
+    echo "  --log-console           Enable logging output to console (default: enabled)"
+    echo "  --no-log-console        Disable logging output to console"
+    echo "  --log-file              Enable saving logs to models/<target>/<timestamp>/logs/ (default: enabled)"
+    echo "  --no-log-file           Disable saving logs to file"
+    echo "  --log-dir PATH          Custom directory for log files (default: models/<target>/<timestamp>/logs)"
     echo "  -h, --help              Show this help message"
     echo ""
     exit "${exit_code}"
@@ -294,6 +307,26 @@ while [[ $# -gt 0 ]]; do
             PULL_ONLY=true
             shift
             ;;
+        --log-console)
+            LOG_CONSOLE="true"
+            shift
+            ;;
+        --no-log-console)
+            LOG_CONSOLE="false"
+            shift
+            ;;
+        --log-file)
+            LOG_FILE="true"
+            shift
+            ;;
+        --no-log-file)
+            LOG_FILE="false"
+            shift
+            ;;
+        --log-dir)
+            LOG_DIR="$2"
+            shift 2
+            ;;
         -h|--help)
             usage 0
             ;;
@@ -305,9 +338,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------------------------------------------------------
-# Virtual Environment Activation
+# Virtual Environment Activation & Python Logging Stream
 # ------------------------------------------------------------------------------
-log_info "Verifying local Python 3.12 environment..."
 VIRTUAL_ENV_PATH=""
 if [[ -d "./venv-torq-312" ]]; then
     VIRTUAL_ENV_PATH="./venv-torq-312"
@@ -318,11 +350,10 @@ else
     exit 1
 fi
 
-log_info "Activating virtual environment: ${VIRTUAL_ENV_PATH}"
 source "${VIRTUAL_ENV_PATH}/bin/activate"
 
 # ------------------------------------------------------------------------------
-# Load Configuration Profile & Apply Overrides
+# Load Configuration Profile & Resolve Target Directory
 # ------------------------------------------------------------------------------
 if [[ -f "${CONFIG_FILE}" ]]; then
     if ! PROFILE_ENV_OUT="$(python3 config_utils.py --profile-env "${PROFILE}" --config "${CONFIG_FILE}")"; then
@@ -333,6 +364,48 @@ fi
 
 PROFILE_NAME="${PROFILE_NAME:-torq}"
 TARGET_FORMAT="${PROFILE_TARGET:-torq}"
+export FRIGATE_TARGET="${TARGET_FORMAT}"
+
+MODELS_TARGET_DIR="${MODELS_DIR}/${TARGET_FORMAT}"
+MODELS_RUN_DIR="${MODELS_TARGET_DIR}/${TIMESTAMP}"
+MODELS_COMPILED_DIR="${MODELS_RUN_DIR}"
+MODELS_LABELS_DIR="${MODELS_RUN_DIR}"
+MODELS_LOGS_DIR="${MODELS_RUN_DIR}/logs"
+mkdir -p "${MODELS_RUN_DIR}"
+
+if [[ -z "${FRIGATE_STREAM_LOGGING_ACTIVE:-}" ]]; then
+    export FRIGATE_STREAM_LOGGING_ACTIVE=1
+    export FRIGATE_LOG_CONSOLE="${LOG_CONSOLE}"
+    export FRIGATE_LOG_FILE="${LOG_FILE}"
+    if [[ "${LOG_FILE}" == "true" ]]; then
+        TARGET_LOG_DIR="${LOG_DIR:-${MODELS_LOGS_DIR}}"
+        export FRIGATE_LOG_DIR="$(python3 "${SCRIPT_DIR}/config_utils.py" --init-log-dir --log-dir "${TARGET_LOG_DIR}")"
+    fi
+    STREAM_ARGS=(--stream-log "train")
+    [[ -n "${FRIGATE_LOG_DIR:-}" ]] && STREAM_ARGS+=(--log-dir "${FRIGATE_LOG_DIR}")
+    if [[ "${LOG_CONSOLE}" == "true" ]]; then
+        STREAM_ARGS+=(--log-console)
+    else
+        STREAM_ARGS+=(--no-log-console)
+    fi
+    if [[ "${LOG_FILE}" == "true" ]]; then
+        STREAM_ARGS+=(--log-file)
+    else
+        STREAM_ARGS+=(--no-log-file)
+    fi
+    "${BASH}" "$0" "${ORIG_ARGS[@]}" 2>&1 | python3 "${SCRIPT_DIR}/config_utils.py" "${STREAM_ARGS[@]}"
+    exit "${PIPESTATUS[0]}"
+fi
+
+log_info "Verifying local Python 3.12 environment..."
+log_info "Activating virtual environment: ${VIRTUAL_ENV_PATH}"
+if [[ "${LOG_FILE}" == "true" && -n "${FRIGATE_LOG_DIR:-}" ]]; then
+    log_info "Logging pipeline output to: ${FRIGATE_LOG_DIR}/train.log"
+fi
+
+# ------------------------------------------------------------------------------
+# Apply Profile Overrides
+# ------------------------------------------------------------------------------
 
 if [[ "${PROFILE_REMOTE:-false}" == "true" || "${PULL_ONLY}" == "true" || "${EXPLICIT_HOST}" == "true" ]]; then
     RUNNER="spark"
@@ -407,7 +480,6 @@ fi
 # ------------------------------------------------------------------------------
 # Normalize Model Names & Dynamic Defaults
 # ------------------------------------------------------------------------------
-TIMESTAMP="$(date +%y%m%d-%H%M)"
 BASE_MODEL_NAME="$(basename "${BASE_MODEL%.*}")"
 RUN_NAME="${BASE_MODEL_NAME}"
 RUN_NAME_STEM="$(basename "${RUN_NAME%.*}")"
@@ -1000,27 +1072,27 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Create Non-Timestamped Soft Links
+# Create Non-Timestamped Soft Links in models/<target>/
 # ------------------------------------------------------------------------------
 MODEL_EXT="${PRIMARY_ARTIFACT##*.}"
-MODEL_SYMLINK="${MODELS_COMPILED_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}.${MODEL_EXT}"
-ln -sf "$(basename "${PRIMARY_ARTIFACT}")" "${MODEL_SYMLINK}"
-log_info "Created soft link: ${MODEL_SYMLINK} -> $(basename "${PRIMARY_ARTIFACT}")"
+MODEL_SYMLINK="${MODELS_TARGET_DIR}/${TARGET_FORMAT}_${RUN_NAME_STEM}.${MODEL_EXT}"
+ln -sfn "${TIMESTAMP}/$(basename "${PRIMARY_ARTIFACT}")" "${MODEL_SYMLINK}"
+log_info "Created soft link: ${MODEL_SYMLINK} -> ${TIMESTAMP}/$(basename "${PRIMARY_ARTIFACT}")"
 
-LABELS_JSON_SYMLINK="${MODELS_LABELS_DIR}/${TARGET_FORMAT}_${BASE_MODEL_NAME}.json"
-ln -sf "$(basename "${LABELS_FILE}")" "${LABELS_JSON_SYMLINK}"
-log_info "Created soft link: ${LABELS_JSON_SYMLINK} -> $(basename "${LABELS_FILE}")"
+LABELS_JSON_SYMLINK="${MODELS_TARGET_DIR}/${TARGET_FORMAT}_${BASE_MODEL_NAME}.json"
+ln -sfn "${TIMESTAMP}/$(basename "${LABELS_FILE}")" "${LABELS_JSON_SYMLINK}"
+log_info "Created soft link: ${LABELS_JSON_SYMLINK} -> ${TIMESTAMP}/$(basename "${LABELS_FILE}")"
 
 LABELS_TXT_FILE="${LABELS_FILE%.json}.txt"
-LABELS_TXT_SYMLINK="${MODELS_LABELS_DIR}/${TARGET_FORMAT}_${BASE_MODEL_NAME}.txt"
+LABELS_TXT_SYMLINK="${MODELS_TARGET_DIR}/${TARGET_FORMAT}_${BASE_MODEL_NAME}.txt"
 if [[ -f "${LABELS_TXT_FILE}" ]]; then
-    ln -sf "$(basename "${LABELS_TXT_FILE}")" "${LABELS_TXT_SYMLINK}"
-    log_info "Created soft link: ${LABELS_TXT_SYMLINK} -> $(basename "${LABELS_TXT_FILE}")"
+    ln -sfn "${TIMESTAMP}/$(basename "${LABELS_TXT_FILE}")" "${LABELS_TXT_SYMLINK}"
+    log_info "Created soft link: ${LABELS_TXT_SYMLINK} -> ${TIMESTAMP}/$(basename "${LABELS_TXT_FILE}")"
 fi
 
-ln -sf "$(basename "${LABELS_FILE}")" "${MODELS_LABELS_DIR}/labels.json"
+ln -sfn "${TIMESTAMP}/$(basename "${LABELS_FILE}")" "${MODELS_TARGET_DIR}/labels.json"
 if [[ -f "${LABELS_TXT_FILE}" ]]; then
-    ln -sf "$(basename "${LABELS_TXT_FILE}")" "${MODELS_LABELS_DIR}/labels.txt"
+    ln -sfn "${TIMESTAMP}/$(basename "${LABELS_TXT_FILE}")" "${MODELS_TARGET_DIR}/labels.txt"
 fi
 
 # ------------------------------------------------------------------------------
@@ -1100,8 +1172,10 @@ if [[ -f "${LABELS_FILE%.json}.txt" ]]; then
     echo "  3. Frigate Labelmap: ${LABELS_FILE%.json}.txt"
     echo "     Soft Link       : ${LABELS_TXT_SYMLINK}"
     echo "  4. PyTorch Weights : ${WEIGHTS_PATH}"
+    [[ -n "${FRIGATE_LOG_DIR:-}" && "${LOG_FILE}" == "true" ]] && echo "  5. Execution Logs  : ${FRIGATE_LOG_DIR}"
 else
     echo "  3. PyTorch Weights : ${WEIGHTS_PATH}"
+    [[ -n "${FRIGATE_LOG_DIR:-}" && "${LOG_FILE}" == "true" ]] && echo "  4. Execution Logs  : ${FRIGATE_LOG_DIR}"
 fi
 POSTPROCESS_ELAPSED=$(( $(date +%s) - POSTPROCESS_START_TS ))
 echo "--------------------------------------------------------------------------"

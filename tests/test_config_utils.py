@@ -426,5 +426,77 @@ def test_get_and_format_checkpoint_metrics(tmp_path):
     assert pytest.approx(fallback_metrics["map50_95"], rel=1e-4) == 0.6125
 
 
+def test_logging_setup_and_options(tmp_path, capsys, monkeypatch):
+    import argparse
+    import io
+
+    monkeypatch.setattr(config_utils, "_ACTIVE_LOG_DIR", None)
+    monkeypatch.delenv("FRIGATE_LOG_DIR", raising=False)
+    monkeypatch.delenv("FRIGATE_LOG_CONSOLE", raising=False)
+    monkeypatch.delenv("FRIGATE_LOG_FILE", raising=False)
+    monkeypatch.delenv("FRIGATE_TARGET", raising=False)
+
+    # 1a. Target-specific resolve_log_dir creates models/<target>/<timestamp>/logs
+    base_models = tmp_path / "models"
+    target_log_dir = config_utils.resolve_log_dir(base_dir=base_models, target="torq", create=True)
+    assert target_log_dir.is_dir()
+    assert target_log_dir.name == "logs"
+    assert target_log_dir.parent.parent == base_models / "torq"
+    assert not (base_models / "latest").exists()
+    assert not (base_models / "torq" / "latest").exists()
+
+    # 1b. Target-agnostic resolve_log_dir creates logs/<timestamp>
+    monkeypatch.setattr(config_utils, "_ACTIVE_LOG_DIR", None)
+    root_logs = tmp_path / "logs"
+    log_dir = config_utils.resolve_log_dir(base_dir=root_logs, create=True)
+    assert log_dir.is_dir()
+    assert log_dir.parent == root_logs
+
+    # 2. Both console and file enabled by default via CLI parser
+    parser = argparse.ArgumentParser()
+    config_utils.add_logging_args(parser)
+    args = parser.parse_args(["--log-dir", str(log_dir)])
+    logger = config_utils.setup_logging_from_args(args, "unit_test_script")
+
+    print("[INFO] Hello from print")
+    logger.warning("[WARN] Warning from logger")
+
+    captured = capsys.readouterr()
+    assert "[INFO] Hello from print" in captured.out
+    assert "[WARN] Warning from logger" in captured.out
+
+    log_file = log_dir / "unit_test_script.log"
+    assert log_file.is_file()
+    content = log_file.read_text(encoding="utf-8")
+    assert "[INFO] [frigate.unit_test_script] [INFO] Hello from print" in content
+    assert "[WARNING] [frigate.unit_test_script] [WARN] Warning from logger" in content
+
+    # 3. File-only mode (--no-log-console)
+    args_no_console = parser.parse_args(["--no-log-console", "--log-dir", str(log_dir)])
+    config_utils.setup_logging_from_args(args_no_console, "silent_script")
+    print("[INFO] File only message")
+    captured_silent = capsys.readouterr()
+    assert captured_silent.out == ""
+    assert "File only message" in (log_dir / "silent_script.log").read_text(encoding="utf-8")
+
+    # 4. Console-only mode (--no-log-file)
+    only_console_dir = tmp_path / "no_file_dir"
+    args_no_file = parser.parse_args(["--no-log-file", "--log-dir", str(only_console_dir)])
+    config_utils.setup_logging_from_args(args_no_file, "console_only_script")
+    print("[INFO] Console only message")
+    captured_console = capsys.readouterr()
+    assert "Console only message" in captured_console.out
+    assert not (only_console_dir / "console_only_script.log").exists()
+
+    # 5. Stream stdin to logger (used by bash scripts)
+    monkeypatch.setattr("sys.stdin", io.StringIO("\033[0;32m[SUCCESS]\033[0m Bash step complete\n[ERROR] Bash failure\n"))
+    config_utils.stream_stdin_to_logger("train", log_to_console=True, log_to_file=True, log_dir=log_dir)
+    train_log_text = (log_dir / "train.log").read_text(encoding="utf-8")
+    assert "[INFO] [frigate.train] [SUCCESS] Bash step complete" in train_log_text
+    assert "[ERROR] [frigate.train] [ERROR] Bash failure" in train_log_text
+    assert "\033[" not in train_log_text
+
+
+
 
 

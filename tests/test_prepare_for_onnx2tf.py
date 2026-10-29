@@ -164,8 +164,10 @@ def test_step4_generate_labels_json_and_symlinks(tmp_path):
     y_file = tmp_path / "data.yaml"
     y_file.write_text(yaml.safe_dump({"names": {0: "person", 80: "chicken"}}))
 
-    labels_dir = tmp_path / "labels"
-    labels_out = labels_dir / "hailo_yolov8m_261023-0800.json"
+    models_dir = tmp_path / "models"
+    target_dir = models_dir / "hailo"
+    run_dir = target_dir / "261023-0800"
+    labels_out = run_dir / "hailo_yolov8m_261023-0800.json"
 
     prepare_for_onnx2tf.step4_generate_labels_json(
         data_yaml_path=str(y_file),
@@ -177,14 +179,16 @@ def test_step4_generate_labels_json_and_symlinks(tmp_path):
     )
 
     assert labels_out.is_file()
-    txt_out = labels_dir / "hailo_yolov8m_261023-0800.txt"
+    txt_out = run_dir / "hailo_yolov8m_261023-0800.txt"
     assert txt_out.is_file()
 
-    # Check soft links without timestamp
-    assert (labels_dir / "hailo_yolov8m.json").is_symlink()
-    assert (labels_dir / "hailo_yolov8m.txt").is_symlink()
-    assert (labels_dir / "labels.json").is_symlink()
-    assert (labels_dir / "labels.txt").is_symlink()
+    # Check soft links in models/<target>/ pointing into <timestamp>/
+    assert (target_dir / "hailo_yolov8m.json").is_symlink()
+    assert (target_dir / "hailo_yolov8m.txt").is_symlink()
+    assert (target_dir / "labels.json").is_symlink()
+    assert (target_dir / "labels.txt").is_symlink()
+    assert (target_dir / "hailo_yolov8m.json").resolve() == labels_out.resolve()
+    assert (target_dir / "labels.txt").resolve() == txt_out.resolve()
 
     with open(labels_out, "r", encoding="utf-8") as f:
         payload = json.load(f)

@@ -34,6 +34,8 @@ import config_utils
 def find_default_model() -> str:
     """Auto-detect the most appropriate default NVIDIA model (.onnx or .pt)."""
     candidates = [
+        Path("models/nvidia/nvidia_yolov9s.onnx"),
+        Path("models/nvidia_yolov9s.onnx"),
         Path("models/compiled/nvidia_yolov9s.onnx"),
         Path("output/best_normalized_output.onnx"),
         Path("output/best.onnx"),
@@ -42,12 +44,18 @@ def find_default_model() -> str:
         if c.is_file():
             return str(c)
 
-    compiled_dir = Path("models/compiled")
-    if compiled_dir.is_dir():
-        onnx_files = sorted(compiled_dir.glob("nvidia_*.onnx"), key=lambda p: p.stat().st_mtime)
+    models_dir = Path("models")
+    if models_dir.is_dir():
+        onnx_files = sorted(models_dir.glob("nvidia/*/nvidia_*.onnx"), key=lambda p: p.stat().st_mtime)
         if onnx_files:
             return str(onnx_files[-1])
-        onnx_files = sorted(compiled_dir.glob("*.onnx"), key=lambda p: p.stat().st_mtime)
+        onnx_files = sorted(models_dir.glob("nvidia/nvidia_*.onnx"), key=lambda p: p.stat().st_mtime)
+        if onnx_files:
+            return str(onnx_files[-1])
+        onnx_files = sorted(models_dir.glob("*/nvidia_*.onnx"), key=lambda p: p.stat().st_mtime)
+        if onnx_files:
+            return str(onnx_files[-1])
+        onnx_files = sorted(models_dir.glob("*/*/*.onnx"), key=lambda p: p.stat().st_mtime)
         if onnx_files:
             return str(onnx_files[-1])
 
@@ -62,7 +70,7 @@ def find_default_model() -> str:
     if Path("yolov9s.pt").is_file():
         return "yolov9s.pt"
 
-    return "models/compiled/nvidia_yolov9s.onnx"
+    return "models/nvidia/nvidia_yolov9s.onnx"
 
 
 def parse_args():
@@ -181,6 +189,7 @@ def parse_args():
         action="store_true",
         help="Print detailed per-image detection results",
     )
+    config_utils.add_logging_args(parser)
     return parser.parse_args()
 
 
@@ -199,6 +208,10 @@ def load_class_names(dataset_dir: Path, labels_path: Optional[str] = None) -> Di
             print(f"[WARN] Could not parse labels file '{labels_path}': {e}")
 
     for candidate in [
+        Path("models/nvidia/nvidia_yolov9s.json"),
+        Path("models/nvidia/labels.json"),
+        Path("models/nvidia_yolov9s.json"),
+        Path("models/labels.json"),
         Path("models/labels/nvidia_yolov9s.json"),
         Path("models/labels/labels.json"),
         Path("labels.json"),
@@ -509,5 +522,11 @@ def evaluate(args):
         print(f"[INFO] Detailed evaluation report saved to: {args.output_json}")
 
 
+def main():
+    args = parse_args()
+    config_utils.setup_logging_from_args(args, "test_nvidia_accuracy", target="nvidia")
+    evaluate(args)
+
+
 if __name__ == "__main__":
-    evaluate(parse_args())
+    main()

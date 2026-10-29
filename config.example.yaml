@@ -105,6 +105,19 @@ modes:
   upload_only: false
 
 # ------------------------------------------------------------------------------
+# Logging Settings (All Bash & Python Scripts)
+# ------------------------------------------------------------------------------
+logging:
+  # Output logs to console (stdout)
+  console: true
+
+  # Save logs to a timestamped folder inside base_dir (models/<timestamp>/logs/)
+  file: true
+
+  # Base models directory where <timestamp>/ folders (model, labels, and logs/) are created
+  base_dir: "./models"
+
+# ------------------------------------------------------------------------------
 # Model Deployment Settings (train.sh & deploy_to_coralboard.sh)
 # ------------------------------------------------------------------------------
 deployment:

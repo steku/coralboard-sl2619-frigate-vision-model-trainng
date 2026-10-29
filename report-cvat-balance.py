@@ -64,6 +64,7 @@ def parse_args():
         dest="output_json",
         help="Output raw JSON data instead of formatted tables",
     )
+    config_utils.add_logging_args(parser)
     return parser.parse_args()
 
 
@@ -305,6 +306,7 @@ def print_text_report(data: Dict[str, Any], include_jobs: bool = False):
 
 def main():
     args = parse_args()
+    config_utils.setup_logging_from_args(args, "report-cvat-balance")
     cfg = load_config(args.config)
     cvat_url, cvat_user, cvat_pass = config_utils.get_cvat_credentials(
         cfg, url=args.cvat_url, user=args.cvat_user, password=args.cvat_pass

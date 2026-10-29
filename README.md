@@ -629,14 +629,18 @@ python report-cvat-balance.py --json
 
 #### Artifact Naming, Soft Links & Pipeline Timing Report
 
-Every compilation run generates timestamped artifacts (`<target>_<model>_<YYMMDD-HHMM>.<ext>`) and automatically updates non-timestamped convenience soft links:
+Every compilation run creates a target-isolated timestamped folder `models/<target>/<YYMMDD-HHMM>/` (containing the compiled model, label maps, and `logs/`) and automatically updates non-timestamped convenience soft links inside `models/<target>/`:
 
-- **Compiled Models (`models/compiled/`)**:
-  - Torq NPU: `torq_yolov8n_<YYMMDD-HHMM>.vmfb` $\rightarrow$ symlinked as `torq_yolov8n.vmfb`
-  - NVIDIA GPU: `nvidia_yolov9s_<YYMMDD-HHMM>.onnx` $\rightarrow$ symlinked as `nvidia_yolov9s.onnx`
-  - Hailo-10H NPU: `hailo_yolov8m_<YYMMDD-HHMM>.hef` $\rightarrow$ symlinked as `hailo_yolov8m.hef`
-- **Label Maps (`models/labels/`)**:
-  - `<target>_<model>_<YYMMDD-HHMM>.{json,txt}` $\rightarrow$ symlinked as `<target>_<model>.{json,txt}` and `labels.{json,txt}`
+- **Compiled Models (`models/<target>/<YYMMDD-HHMM>/`)**:
+  - Torq NPU: `models/torq/<YYMMDD-HHMM>/torq_yolov8n_<YYMMDD-HHMM>.vmfb` $\rightarrow$ symlinked at `models/torq/torq_yolov8n.vmfb`
+  - NVIDIA GPU: `models/nvidia/<YYMMDD-HHMM>/nvidia_yolov9s_<YYMMDD-HHMM>.onnx` $\rightarrow$ symlinked at `models/nvidia/nvidia_yolov9s.onnx`
+  - Hailo-10H NPU: `models/hailo/<YYMMDD-HHMM>/hailo_yolov8m_<YYMMDD-HHMM>.hef` $\rightarrow$ symlinked at `models/hailo/hailo_yolov8m.hef`
+- **Label Maps (`models/<target>/<YYMMDD-HHMM>/`)**:
+  - `models/<target>/<YYMMDD-HHMM>/<target>_<model>_<YYMMDD-HHMM>.{json,txt}` $\rightarrow$ symlinked at `models/<target>/<target>_<model>.{json,txt}` and `models/<target>/labels.{json,txt}`
+- **Execution Logs**:
+  - Target-specific runs (`train.sh`, `prepare_for_onnx2tf.py`, `deploy_to_coralboard.sh`, `test_nvidia_accuracy.py`) log to `models/<target>/<YYMMDD-HHMM>/logs/<script_name>.log`.
+  - Target-agnostic standalone scripts (`frigate-to-cvat.py`, `folder-to-cvat.py`, `export-cvat-to-yolo.py`, `report-cvat-balance.py`, `test_server_accuracy.py`) log to `logs/<YYMMDD-HHMM>/<script_name>.log` in the git root.
+  - All scripts accept `--log-console` / `--no-log-console`, `--log-file` / `--no-log-file`, and `--log-dir PATH` (or `logging.console` / `logging.file` in `config.yaml`).
 
 At the completion of `train.sh`, a **Model Metrics & Timing Summary** report is printed:
 ```text
@@ -968,7 +972,7 @@ python export-cvat-to-yolo.py --export all --replace
 | [`folder-to-cvat.py`](folder-to-cvat.py) | **Folder Image Uploader**: Ingests all images in a local directory with labels from a YAML file and creates a task in CVAT without filtering. |
 | [`report-cvat-balance.py`](report-cvat-balance.py) | **CVAT Dataset Balance Auditor**: Inspects annotation distributions across CVAT tasks/jobs, calculating class deficits, health status, and visual bars. |
 | [`train.sh`](train.sh) | **Unified Pipeline Runner**: Automates CVAT export, local GPU or remote Spark training (`-p torq-spark`, `-p nvidia-spark`, `-p hailo-spark`), ONNX export, INT8 quantization, TOSA/Torq or Hailo-10H `.hef` compilation, deployment, and phase timing reports. |
-| [`config_utils.py`](config_utils.py) | **Configuration & Shared Evaluation Engine**: Parses `config.yaml`, resolves execution profiles, normalizes balance modes, maps COCO-80 + custom classes, provides shared IoU/ground-truth/dataset-pair evaluation helpers, and dumps shell variables for `train.sh`. |
+| [`config_utils.py`](config_utils.py) | **Configuration, Logging & Shared Evaluation Engine**: Parses `config.yaml`, resolves execution profiles, configures centralized Python `logging` (`models/<timestamp>/logs/`), maps COCO-80 + custom classes, provides shared IoU/ground-truth/dataset-pair evaluation helpers, and dumps shell variables for `train.sh`. |
 | [`export-cvat-to-yolo.py`](export-cvat-to-yolo.py) | **CVAT Exporter**: Connects to CVAT REST API and exports annotations to `datasets/yolo/` with train/val splits and `data.yaml`. |
 | [`deploy_to_coralboard.sh`](deploy_to_coralboard.sh) | **Model Deployer**: Deploys compiled `.vmfb` and `labels.json` to Coralboard locally or via SCP, with optional SSH service restart and HTTP health checks. |
 | [`test_server_accuracy.py`](test_server_accuracy.py) | **Server Accuracy Benchmark**: Evaluates running vision proxy against dataset images and COCO reference images, measuring precision, recall, F1, and NPU latency. |

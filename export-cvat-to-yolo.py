@@ -388,8 +388,10 @@ def main():
         default=default_cvat_pass,
         help="CVAT password (default: set via config or $CVAT_PASS)",
     )
+    config_utils.add_logging_args(parser)
 
     args = parser.parse_args()
+    config_utils.setup_logging_from_args(args, "export-cvat-to-yolo")
 
     # Re-read config if custom path passed
     if args.config:

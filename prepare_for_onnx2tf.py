@@ -374,10 +374,10 @@ def step4_generate_labels_json(
     names = load_dataset_metadata(data_yaml_path)
     resolved_base = base_model_name or model_name
     if labels_out is None:
-        timestamp = datetime.datetime.now().strftime("%y%m%d-%H%M")
-        labels_dir = Path("models/labels")
-        if labels_dir.exists():
-            labels_out = str(labels_dir / f"{target}_{resolved_base}_{timestamp}.json")
+        timestamp = os.getenv("FRIGATE_RUN_TIMESTAMP") or datetime.datetime.now().strftime("%y%m%d-%H%M")
+        models_dir = Path("models")
+        if models_dir.exists():
+            labels_out = str(models_dir / target / timestamp / f"{target}_{resolved_base}_{timestamp}.json")
         else:
             labels_out = f"{target}_{resolved_base}_{timestamp}.json"
 
@@ -425,12 +425,20 @@ def step4_generate_labels_json(
         for k in sorted(names.keys(), key=int):
             f.write(f"{k} {names[k]}\n")
 
-    # Create soft links without datetime
+    # Create soft links without datetime in models/<target>/ (or parent directory if standalone)
     labels_dir = labels_path.parent
-    _update_symlink(labels_dir / f"{target}_{resolved_base}.json", labels_path)
-    _update_symlink(labels_dir / f"{target}_{resolved_base}.txt", txt_out)
-    _update_symlink(labels_dir / "labels.json", labels_path)
-    _update_symlink(labels_dir / "labels.txt", txt_out)
+    if labels_dir.parent != labels_dir and (
+        labels_dir.parent.name in ("torq", "nvidia", "hailo")
+        or (labels_dir.parent.parent != labels_dir.parent and labels_dir.parent.parent.name == "models")
+    ):
+        symlink_dir = labels_dir.parent
+    else:
+        symlink_dir = labels_dir
+
+    _update_symlink(symlink_dir / f"{target}_{resolved_base}.json", labels_path)
+    _update_symlink(symlink_dir / f"{target}_{resolved_base}.txt", txt_out)
+    _update_symlink(symlink_dir / "labels.json", labels_path)
+    _update_symlink(symlink_dir / "labels.txt", txt_out)
 
 
 def _update_symlink(link_path: Path, target_path: Path) -> None:
@@ -438,7 +446,8 @@ def _update_symlink(link_path: Path, target_path: Path) -> None:
         if link_path.is_symlink() or link_path.exists():
             link_path.unlink()
         try:
-            link_path.symlink_to(target_path.name)
+            rel_target = os.path.relpath(target_path, start=link_path.parent)
+            link_path.symlink_to(rel_target)
         except OSError:
             pass
 
@@ -464,7 +473,7 @@ def main():
     parser.add_argument("--output-calib", default=default_calib, help=f"Path to output calibration .npy file (default: {default_calib})")
     default_data_yaml = "datasets/data.yaml"
     parser.add_argument("--data-yaml", default=default_data_yaml, help="Path to data.yaml")
-    parser.add_argument("--output-labels", default=None, help="Path to labels JSON output (default: models/labels/<target>_<base_model_name>_<timestamp>.json)")
+    parser.add_argument("--output-labels", default=None, help="Path to labels JSON output (default: models/<target>/<timestamp>/<target>_<base_model_name>_<timestamp>.json)")
     parser.add_argument("--imgsz", type=int, default=320, help="Model image resolution (default: 320)")
     parser.add_argument("--max-calib", type=int, default=300, help="Max calibration images (default: 300)")
     parser.add_argument("--min-calib", type=int, default=50, help="Min calibration images when using percentage (default: 50)")
@@ -474,8 +483,10 @@ def main():
     parser.add_argument("--base-model-name", default=None, help="Base model name (default: derived from model-pt or YOLO)")
     parser.add_argument("--skip-export", action="store_true", help="Skip ONNX export (use existing input-onnx)")
     parser.add_argument("--target", default="torq", choices=["torq", "nvidia", "hailo"], help="Target format (default: torq)")
+    config_utils.add_logging_args(parser)
 
     args = parser.parse_args()
+    config_utils.setup_logging_from_args(args, "prepare_for_onnx2tf")
 
     if not args.skip_export:
         step1_export_onnx(args.model_pt, args.input_onnx, args.imgsz)
@@ -495,10 +506,10 @@ def main():
     if args.output_labels:
         output_labels = args.output_labels
     else:
-        timestamp = datetime.datetime.now().strftime("%y%m%d-%H%M")
-        labels_dir = Path("models/labels")
-        if labels_dir.exists():
-            output_labels = str(labels_dir / f"{args.target}_{detected_name}_{timestamp}.json")
+        timestamp = os.getenv("FRIGATE_RUN_TIMESTAMP") or datetime.datetime.now().strftime("%y%m%d-%H%M")
+        models_dir = Path("models")
+        if models_dir.exists():
+            output_labels = str(models_dir / args.target / timestamp / f"{args.target}_{detected_name}_{timestamp}.json")
         else:
             output_labels = f"{args.target}_{detected_name}_{timestamp}.json"
 

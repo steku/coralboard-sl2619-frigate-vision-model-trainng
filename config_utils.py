@@ -3,12 +3,17 @@
 Shared configuration, CVAT client, and model metadata utilities for Frigate training.
 """
 
+import argparse
+import builtins
 from collections import Counter
 import datetime
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import sys
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple, Union
 import yaml
 
@@ -114,7 +119,7 @@ def get_cvat_client(
 
 def load_dataset_classes(data_yaml_path: str = "datasets/data.yaml") -> Dict[int, str]:
     """
-    Load index-to-class-name mapping from a YOLO data.yaml or models/labels/*.json.
+    Load index-to-class-name mapping from a YOLO data.yaml or models/*.json / models/<timestamp>/labels/*.json.
     """
     p = Path(data_yaml_path)
     if not p.is_file() and data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml"):
@@ -124,16 +129,18 @@ def load_dataset_classes(data_yaml_path: str = "datasets/data.yaml") -> Dict[int
                 break
 
     if not p.is_file():
-        # Check fallback to models/labels/*.json only when using default dataset paths
+        # Check fallback to models/<target>/*.json or models/<target>/<timestamp>/*.json only when using default dataset paths
         if data_yaml_path in ("datasets/data.yaml", "datasets/yolo/data.yaml", "yolo_dataset/data.yaml"):
-            labels_dir = Path("models/labels")
-            if labels_dir.is_dir():
+            models_dir = Path("models")
+            if models_dir.is_dir():
                 candidates = [
-                    labels_dir / "torq_yolov8n.json",
-                    labels_dir / "nvidia_yolov9s.json",
-                    labels_dir / "hailo_yolov8m.json",
-                    labels_dir / "labels.json",
-                ] + sorted(labels_dir.glob("*.json"))
+                    models_dir / "torq" / "torq_yolov8n.json",
+                    models_dir / "torq" / "labels.json",
+                    models_dir / "nvidia" / "nvidia_yolov9s.json",
+                    models_dir / "nvidia" / "labels.json",
+                    models_dir / "hailo" / "hailo_yolov8m.json",
+                    models_dir / "hailo" / "labels.json",
+                ] + sorted(models_dir.glob("*/*/*.json")) + sorted(models_dir.glob("*/*.json")) + sorted(models_dir.glob("*.json"))
                 for f in candidates:
                     if f.is_file():
                         try:
@@ -1045,23 +1052,345 @@ def format_checkpoint_metrics_report(weights_path: Union[str, Path]) -> str:
     )
 
 
+# ==============================================================================
+# Centralized Python Logging Library Integration
+# ==============================================================================
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_ORIG_PRINT = builtins.print
+_ACTIVE_LOGGER: Optional[logging.Logger] = None
+_ACTIVE_LOG_DIR: Optional[Path] = None
+
+
+def _parse_bool_flag(val: Any, default: bool = True) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
+class _DynamicConsoleStreamHandler(logging.StreamHandler):
+    """StreamHandler that dynamically writes to current sys.stdout (supports pytest capsys)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            stream = sys.stdout
+            stream.write(msg + self.terminator)
+            stream.flush()
+        except Exception:
+            self.handleError(record)
+
+
+class _CleanFileFormatter(logging.Formatter):
+    """Log file formatter that strips ANSI color escape sequences for clean log files."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        return _ANSI_ESCAPE_RE.sub("", formatted)
+
+
+def get_logging_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Retrieve logging settings (console, file, base_dir) from config.yaml and environment variables."""
+    if cfg is None:
+        cfg = load_config()
+    log_cfg = cfg.get("logging", {}) if isinstance(cfg.get("logging"), dict) else {}
+
+    env_console = os.getenv("FRIGATE_LOG_CONSOLE")
+    env_file = os.getenv("FRIGATE_LOG_FILE")
+    env_dir = os.getenv("FRIGATE_LOG_DIR")
+
+    console = _parse_bool_flag(
+        env_console if env_console is not None else log_cfg.get("console"),
+        default=True,
+    )
+    file_enabled = _parse_bool_flag(
+        env_file if env_file is not None else log_cfg.get("file"),
+        default=True,
+    )
+    base_dir = str(log_cfg.get("base_dir") or "models")
+    if base_dir.rstrip("/").endswith("models/logs"):
+        base_dir = base_dir.rstrip("/")[:-5] or "models"
+
+    return {
+        "console": console,
+        "file": file_enabled,
+        "base_dir": base_dir,
+        "log_dir": env_dir,
+    }
+
+
+def resolve_log_dir(
+    log_dir: Optional[Union[str, Path]] = None,
+    base_dir: Optional[Union[str, Path]] = None,
+    target: Optional[str] = None,
+    create: bool = True,
+) -> Path:
+    """
+    Resolve or create a timestamped log directory:
+    - Target-specific runs: models/<target>/<timestamp>/logs
+    - Standalone target-agnostic runs: logs/<timestamp> (in git root)
+    Reuses FRIGATE_LOG_DIR if set so multi-step pipeline runs share one timestamped folder.
+    """
+    global _ACTIVE_LOG_DIR
+
+    if log_dir:
+        resolved = Path(log_dir).resolve()
+    elif os.getenv("FRIGATE_LOG_DIR"):
+        resolved = Path(os.environ["FRIGATE_LOG_DIR"]).resolve()
+    elif _ACTIVE_LOG_DIR is not None:
+        resolved = _ACTIVE_LOG_DIR
+    else:
+        timestamp = os.getenv("FRIGATE_RUN_TIMESTAMP") or datetime.datetime.now().strftime("%y%m%d-%H%M")
+        resolved_target = target or os.getenv("FRIGATE_TARGET")
+        repo_root = Path(__file__).resolve().parent
+
+        if os.getenv("PYTEST_CURRENT_TEST") and base_dir is None:
+            test_root = Path(tempfile.gettempdir()) / "frigate_pytest_logs"
+            if resolved_target:
+                resolved = test_root / "models" / resolved_target / timestamp / "logs"
+            else:
+                resolved = test_root / "logs" / timestamp
+        elif resolved_target:
+            cfg_settings = get_logging_settings()
+            b_dir = Path(base_dir or cfg_settings["base_dir"])
+            if not b_dir.is_absolute():
+                b_dir = repo_root / b_dir
+            root_models = b_dir.resolve()
+            if root_models.name == "logs":
+                root_models = root_models.parent if root_models.parent.name == "models" else (repo_root / "models")
+            resolved = root_models / resolved_target / timestamp / "logs"
+        else:
+            if base_dir is not None:
+                b_dir = Path(base_dir)
+                if not b_dir.is_absolute():
+                    b_dir = repo_root / b_dir
+                root_logs = b_dir.resolve()
+                if root_logs.name != "logs":
+                    root_logs = root_logs / "logs"
+            else:
+                root_logs = (repo_root / "logs").resolve()
+            resolved = root_logs / timestamp
+        _ACTIVE_LOG_DIR = resolved
+
+    if create:
+        resolved.mkdir(parents=True, exist_ok=True)
+
+    return resolved
+
+
+def _infer_log_level(message: str) -> int:
+    clean = _ANSI_ESCAPE_RE.sub("", message).lstrip()
+    if clean.startswith("[ERROR]") or clean.startswith("ERROR:"):
+        return logging.ERROR
+    if clean.startswith("[WARN]") or clean.startswith("[WARNING]") or clean.startswith("WARNING:"):
+        return logging.WARNING
+    return logging.INFO
+
+
+def _logging_print(*args: Any, sep: str = " ", end: str = "\n", file: Any = None, flush: bool = False) -> None:
+    """Route print() calls through the active Python logging.Logger when configured."""
+    if _ACTIVE_LOGGER is None or (file is not None and file not in (sys.stdout, sys.stderr)):
+        _ORIG_PRINT(*args, sep=sep, end=end, file=file, flush=flush)
+        return
+
+    text = sep.join(str(a) for a in args)
+    if end and end != "\n":
+        text = text + end
+
+    lines = text.splitlines() if text else [""]
+    for line in lines:
+        lvl = logging.ERROR if file is sys.stderr and _infer_log_level(line) == logging.INFO else _infer_log_level(line)
+        _ACTIVE_LOGGER.log(lvl, line)
+
+
+def get_logger(name: str = "frigate") -> logging.Logger:
+    """Return a Python logging.Logger instance."""
+    clean_name = Path(name).stem if ("/" in name or "\\" in name or name.endswith(".py") or name.endswith(".sh")) else name
+    logger_name = clean_name if clean_name.startswith("frigate") else f"frigate.{clean_name}"
+    logger = logging.getLogger(logger_name)
+    if not logger.handlers and not logging.getLogger("frigate").handlers:
+        root_frigate = logging.getLogger("frigate")
+        root_frigate.setLevel(logging.INFO)
+        root_frigate.propagate = False
+        ch = _DynamicConsoleStreamHandler()
+        ch.setFormatter(logging.Formatter("%(message)s"))
+        root_frigate.addHandler(ch)
+    return logger
+
+
+def setup_logging(
+    script_name: str,
+    log_to_console: Optional[bool] = None,
+    log_to_file: Optional[bool] = None,
+    log_dir: Optional[Union[str, Path]] = None,
+    target: Optional[str] = None,
+    level: int = logging.INFO,
+    intercept_print: bool = True,
+) -> logging.Logger:
+    """
+    Configure Python logging to output to console and/or a timestamped log file.
+    Both console and file logging are enabled by default.
+    """
+    global _ACTIVE_LOGGER
+
+    settings = get_logging_settings()
+    if log_to_console is None and os.getenv("FRIGATE_STREAM_LOGGING_ACTIVE") == "1" and intercept_print:
+        use_console = True
+    else:
+        use_console = settings["console"] if log_to_console is None else bool(log_to_console)
+    use_file = settings["file"] if log_to_file is None else bool(log_to_file)
+
+    clean_script = Path(script_name).stem.replace(" ", "_")
+    root_logger = logging.getLogger("frigate")
+    root_logger.setLevel(level)
+    root_logger.propagate = False
+
+    # Close and clear previous handlers
+    for h in list(root_logger.handlers):
+        root_logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+
+    if use_console:
+        console_handler = _DynamicConsoleStreamHandler()
+        console_handler.setLevel(level)
+        console_handler.setFormatter(logging.Formatter("%(message)s"))
+        root_logger.addHandler(console_handler)
+
+    log_file_path: Optional[Path] = None
+    if use_file:
+        target_dir = resolve_log_dir(log_dir=log_dir, target=target, create=True)
+        log_file_path = target_dir / f"{clean_script}.log"
+        file_handler = logging.FileHandler(log_file_path, mode="a", encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(
+            _CleanFileFormatter(
+                fmt="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        root_logger.addHandler(file_handler)
+
+    if not root_logger.handlers:
+        root_logger.addHandler(logging.NullHandler())
+
+    logger = logging.getLogger(f"frigate.{clean_script}")
+    logger.setLevel(level)
+    logger.propagate = True
+    logger.log_file_path = log_file_path  # type: ignore[attr-defined]
+    logger.log_dir = log_file_path.parent if log_file_path else None  # type: ignore[attr-defined]
+
+    if intercept_print:
+        _ACTIVE_LOGGER = logger
+        builtins.print = _logging_print
+
+    return logger
+
+
+def add_logging_args(parser: argparse.ArgumentParser) -> None:
+    """Add --log-console / --no-log-console, --log-file / --no-log-file, and --log-dir CLI options."""
+    log_group = parser.add_argument_group("Logging Options")
+    log_group.add_argument(
+        "--log-console",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable logging output to console (default: enabled)",
+    )
+    log_group.add_argument(
+        "--log-file",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable saving logs to models/<timestamp>/logs/ (default: enabled)",
+    )
+    log_group.add_argument(
+        "--log-dir",
+        default=None,
+        help="Custom directory for log files (default: models/<timestamp>/logs)",
+    )
+
+
+def setup_logging_from_args(
+    args: argparse.Namespace,
+    script_name: str,
+    target: Optional[str] = None,
+) -> logging.Logger:
+    """Initialize Python logging from parsed CLI arguments."""
+    return setup_logging(
+        script_name=script_name,
+        log_to_console=getattr(args, "log_console", None),
+        log_to_file=getattr(args, "log_file", None),
+        log_dir=getattr(args, "log_dir", None),
+        target=target or getattr(args, "target", None),
+    )
+
+
+def stream_stdin_to_logger(
+    script_name: str,
+    log_to_console: Optional[bool] = None,
+    log_to_file: Optional[bool] = None,
+    log_dir: Optional[Union[str, Path]] = None,
+    target: Optional[str] = None,
+) -> None:
+    """Read lines from stdin (e.g. from bash scripts) and log them via Python's logging library."""
+    logger = setup_logging(
+        script_name=script_name,
+        log_to_console=log_to_console,
+        log_to_file=log_to_file,
+        log_dir=log_dir,
+        target=target,
+        intercept_print=False,
+    )
+    try:
+        while True:
+            raw_line = sys.stdin.readline()
+            if not raw_line:
+                break
+            line = raw_line.rstrip("\r\n")
+            lvl = _infer_log_level(line)
+            logger.log(lvl, line)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        logging.shutdown()
+
+
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Configuration profile CLI utility")
+    parser = argparse.ArgumentParser(description="Configuration profile & logging CLI utility")
     parser.add_argument("--profile-env", nargs="?", const="", default=None, help="Output shell env assignments for profile")
     parser.add_argument("--checkpoint-metrics", default=None, help="Output formatted mAP50 and mAP50-95 report for a .pt checkpoint")
+    parser.add_argument("--init-log-dir", action="store_true", help="Create and print a new timestamped log directory")
+    parser.add_argument("--stream-log", default=None, metavar="SCRIPT_NAME", help="Stream stdin through Python logging library")
+    parser.add_argument("--target", default=None, help="Optional target (torq, nvidia, hailo) for log directory resolution")
     parser.add_argument("--config", "-c", default=None, help="Path to config.yaml")
+    add_logging_args(parser)
     args = parser.parse_args()
 
-    if args.checkpoint_metrics is not None:
-        print(format_checkpoint_metrics_report(args.checkpoint_metrics))
+    if args.stream_log is not None:
+        stream_stdin_to_logger(
+            script_name=args.stream_log,
+            log_to_console=args.log_console,
+            log_to_file=args.log_file,
+            log_dir=args.log_dir,
+            target=args.target,
+        )
+    elif args.init_log_dir:
+        _ORIG_PRINT(str(resolve_log_dir(log_dir=args.log_dir, target=args.target, create=True)))
+    elif args.checkpoint_metrics is not None:
+        _ORIG_PRINT(format_checkpoint_metrics_report(args.checkpoint_metrics))
     elif args.profile_env is not None:
-        import sys
         prof_arg = args.profile_env if args.profile_env else None
         try:
-            print(dump_profile_env(prof_arg, args.config))
+            _ORIG_PRINT(dump_profile_env(prof_arg, args.config))
         except ValueError as exc:
-            print(f"[ERROR] {exc}", file=sys.stderr)
+            _ORIG_PRINT(f"[ERROR] {exc}", file=sys.stderr)
             sys.exit(1)
 
 

@@ -35,15 +35,20 @@ DEPLOY_DIR="${DEPLOY_DIR:-}"
 RESTART_SERVICE=false
 SERVICE_NAME="coralboard-sl2619-vision"
 DO_HEALTH_CHECK=false
+LOG_CONSOLE="${FRIGATE_LOG_CONSOLE:-true}"
+LOG_FILE="${FRIGATE_LOG_FILE:-true}"
+LOG_DIR="${FRIGATE_LOG_DIR:-}"
+ORIG_ARGS=("$@")
+
+PYTHON_BIN="python3"
+if [[ -x "./venv-torq-312/bin/python" ]]; then
+    PYTHON_BIN="./venv-torq-312/bin/python"
+elif [[ -x "./venv/bin/python" ]]; then
+    PYTHON_BIN="./venv/bin/python"
+fi
 
 # Load settings from config.yaml if available
 if [[ -f "config.yaml" ]]; then
-    PYTHON_BIN="python3"
-    if [[ -x "./venv-torq-312/bin/python" ]]; then
-        PYTHON_BIN="./venv-torq-312/bin/python"
-    elif [[ -x "./venv/bin/python" ]]; then
-        PYTHON_BIN="./venv/bin/python"
-    fi
 
     ${PYTHON_BIN} -c "import yaml" &>/dev/null && {
         CFG_HOST=$(${PYTHON_BIN} -c "import yaml; c=yaml.safe_load(open('config.yaml')).get('deployment',{}) or {}; print(c.get('host') or '')" 2>/dev/null || true)
@@ -77,13 +82,20 @@ usage() {
     echo "  --dir PATH              Local directory destination (e.g. ../coralboard-sl2619-vision/models)"
     echo ""
     echo "Artifact Options:"
-    echo "  --model PATH            Path to compiled .vmfb model (default: auto-detected models/compiled/torq_*.vmfb)"
-    echo "  --labels PATH           Path to labels JSON mapping (default: auto-detected models/labels/torq_<name>.json)"
+    echo "  --model PATH            Path to compiled .vmfb model (default: auto-detected models/torq/torq_*.vmfb or models/torq/<timestamp>/torq_*.vmfb)"
+    echo "  --labels PATH           Path to labels JSON mapping (default: auto-detected models/torq/torq_<name>.json or models/torq/<timestamp>/torq_<name>.json)"
     echo ""
     echo "Service Management:"
     echo "  --restart               Restart the remote vision service via SSH after deployment"
     echo "  --service-name NAME     Name of systemd service on Coralboard (default: coralboard-sl2619-vision)"
     echo "  --check                 Perform HTTP health check on Coralboard after deployment"
+    echo ""
+    echo "Logging Options:"
+    echo "  --log-console           Enable logging output to console (default: enabled)"
+    echo "  --no-log-console        Disable logging output to console"
+    echo "  --log-file              Enable saving logs to models/torq/<timestamp>/logs/ (default: enabled)"
+    echo "  --no-log-file           Disable saving logs to file"
+    echo "  --log-dir PATH          Custom directory for log files (default: models/torq/<timestamp>/logs)"
     echo ""
     echo "Help:"
     echo "  -h, --help              Show this help message"
@@ -124,6 +136,26 @@ while [[ $# -gt 0 ]]; do
             DO_HEALTH_CHECK=true
             shift
             ;;
+        --log-console)
+            LOG_CONSOLE="true"
+            shift
+            ;;
+        --no-log-console)
+            LOG_CONSOLE="false"
+            shift
+            ;;
+        --log-file)
+            LOG_FILE="true"
+            shift
+            ;;
+        --no-log-file)
+            LOG_FILE="false"
+            shift
+            ;;
+        --log-dir)
+            LOG_DIR="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -134,6 +166,31 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -z "${FRIGATE_DEPLOY_LOGGING_ACTIVE:-}" ]]; then
+    export FRIGATE_DEPLOY_LOGGING_ACTIVE=1
+    export FRIGATE_LOG_CONSOLE="${LOG_CONSOLE}"
+    export FRIGATE_LOG_FILE="${LOG_FILE}"
+    if [[ "${LOG_FILE}" == "true" && -z "${FRIGATE_LOG_DIR:-}" ]]; then
+        export FRIGATE_LOG_DIR="$(${PYTHON_BIN} "${SCRIPT_DIR}/config_utils.py" --init-log-dir --target torq ${LOG_DIR:+--log-dir "${LOG_DIR}"})"
+    elif [[ -n "${LOG_DIR}" ]]; then
+        export FRIGATE_LOG_DIR="$(${PYTHON_BIN} "${SCRIPT_DIR}/config_utils.py" --init-log-dir --target torq --log-dir "${LOG_DIR}")"
+    fi
+    STREAM_ARGS=(--stream-log "deploy_to_coralboard" --target "torq")
+    [[ -n "${FRIGATE_LOG_DIR:-}" ]] && STREAM_ARGS+=(--log-dir "${FRIGATE_LOG_DIR}")
+    if [[ "${LOG_CONSOLE}" == "true" ]]; then
+        STREAM_ARGS+=(--log-console)
+    else
+        STREAM_ARGS+=(--no-log-console)
+    fi
+    if [[ "${LOG_FILE}" == "true" ]]; then
+        STREAM_ARGS+=(--log-file)
+    else
+        STREAM_ARGS+=(--no-log-file)
+    fi
+    "${BASH}" "$0" "${ORIG_ARGS[@]}" 2>&1 | ${PYTHON_BIN} "${SCRIPT_DIR}/config_utils.py" "${STREAM_ARGS[@]}"
+    exit "${PIPESTATUS[0]}"
+fi
+
 echo "=========================================================================="
 echo "  Deploy Model & Labels to Coralboard Vision Service"
 echo "=========================================================================="
@@ -142,11 +199,11 @@ echo "==========================================================================
 # Validate Model & Labels Artifacts
 # ------------------------------------------------------------------------------
 if [[ -z "${MODEL_PATH}" ]]; then
-    # Auto-detect latest compiled *.vmfb by modification timestamp in models/compiled/ or root
-    MODEL_PATH=$(find models/compiled models . -maxdepth 2 -name "torq_*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+    # Auto-detect latest compiled *.vmfb in models/torq/<timestamp>/ or models/torq/
+    MODEL_PATH=$(find models/torq models . -maxdepth 3 -name "torq_*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
     MODEL_PATH="${MODEL_PATH#./}"
     if [[ -z "${MODEL_PATH}" ]]; then
-        MODEL_PATH=$(find models/compiled models . -maxdepth 2 -name "*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+        MODEL_PATH=$(find models/torq models . -maxdepth 3 -name "*.vmfb" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
         MODEL_PATH="${MODEL_PATH#./}"
     fi
 fi
@@ -160,14 +217,19 @@ if [[ -z "${LABELS_PATH}" ]]; then
     MODEL_STEM="$(basename "${MODEL_PATH%.*}")"
     CANDIDATE_NAME="${MODEL_STEM#torq_}"
     CANDIDATE_BASE="${CANDIDATE_NAME%_[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]}"
-    if [[ -f "models/labels/torq_${CANDIDATE_BASE}.json" ]]; then
-        LABELS_PATH="models/labels/torq_${CANDIDATE_BASE}.json"
-    elif [[ -f "models/labels/torq_${CANDIDATE_NAME}.json" ]]; then
-        LABELS_PATH="models/labels/torq_${CANDIDATE_NAME}.json"
-    elif [[ -f "models/labels/labels.json" ]]; then
-        LABELS_PATH="models/labels/labels.json"
+    MODEL_RUN_DIR="$(dirname "${MODEL_PATH}")"
+    if [[ -f "${MODEL_RUN_DIR}/torq_${CANDIDATE_NAME}.json" ]]; then
+        LABELS_PATH="${MODEL_RUN_DIR}/torq_${CANDIDATE_NAME}.json"
+    elif [[ -f "models/torq/torq_${CANDIDATE_BASE}.json" ]]; then
+        LABELS_PATH="models/torq/torq_${CANDIDATE_BASE}.json"
+    elif [[ -f "models/torq/torq_${CANDIDATE_NAME}.json" ]]; then
+        LABELS_PATH="models/torq/torq_${CANDIDATE_NAME}.json"
+    elif [[ -f "models/torq/labels.json" ]]; then
+        LABELS_PATH="models/torq/labels.json"
+    elif [[ -f "models/torq_${CANDIDATE_BASE}.json" ]]; then
+        LABELS_PATH="models/torq_${CANDIDATE_BASE}.json"
     else
-        LATEST_LABELS=$(find models/labels -maxdepth 1 -name "*.json" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
+        LATEST_LABELS=$(find models/torq models -maxdepth 3 -name "*.json" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")
         if [[ -n "${LATEST_LABELS}" ]]; then
             LABELS_PATH="${LATEST_LABELS}"
         fi
