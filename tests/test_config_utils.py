@@ -216,6 +216,71 @@ def test_dump_profile_env():
     assert "PROFILE_BASE_MODEL='yolov9s.pt'" in nvidia_env_str
 
 
+def test_config_profiles_crud(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    initial_content = """# Header comment
+frigate:
+  url: "http://localhost:5000"
+
+default_profile: torq
+
+profiles:
+  torq:
+    target: torq
+    device: "0"
+  hailo:
+    target: hailo
+    device: "0"
+"""
+    config_file.write_text(initial_content, encoding="utf-8")
+
+    # 1. Create/Save new profile
+    new_profile_data = {
+        "target": "nvidia",
+        "device": "1",
+        "batch": 32,
+        "epochs": 100,
+        "base_model": "yolov9s.pt",
+    }
+    res = config_utils.save_profile("nvidia-custom", new_profile_data, is_default=True, config_path=str(config_file))
+    assert res["name"] == "nvidia-custom"
+    assert res["default_profile"] == "nvidia-custom"
+
+    # Verify comments preserved
+    content = config_file.read_text(encoding="utf-8")
+    assert "# Header comment" in content
+    assert "frigate:" in content
+
+    # Verify loaded
+    cfg = config_utils.load_config(str(config_file))
+    assert cfg["default_profile"] == "nvidia-custom"
+    assert "nvidia-custom" in cfg["profiles"]
+    assert cfg["profiles"]["nvidia-custom"]["batch"] == 32
+
+    # 2. Update existing profile
+    new_profile_data["batch"] = 64
+    config_utils.save_profile("nvidia-custom", new_profile_data, is_default=False, config_path=str(config_file))
+    cfg = config_utils.load_config(str(config_file))
+    assert cfg["profiles"]["nvidia-custom"]["batch"] == 64
+
+    # 3. Set default profile
+    config_utils.set_default_profile("hailo", config_path=str(config_file))
+    cfg = config_utils.load_config(str(config_file))
+    assert cfg["default_profile"] == "hailo"
+
+    # 4. Delete profile
+    config_utils.delete_profile("nvidia-custom", config_path=str(config_file))
+    cfg = config_utils.load_config(str(config_file))
+    assert "nvidia-custom" not in cfg["profiles"]
+
+    # 5. Validation errors
+    with pytest.raises(ValueError, match="Invalid profile name"):
+        config_utils.save_profile("invalid name!", {}, config_path=str(config_file))
+
+    with pytest.raises(ValueError, match="does not exist"):
+        config_utils.delete_profile("nonexistent", config_path=str(config_file))
+
+
 def test_prepare_training_data_yaml(tmp_path, monkeypatch):
     # Create fake workspace directory structure
     yolo_dir = tmp_path / "datasets" / "yolo"

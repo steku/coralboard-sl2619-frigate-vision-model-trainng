@@ -95,6 +95,13 @@ storage:
   output_dir: "./datasets/staging"
 
 # ------------------------------------------------------------------------------
+# Web UI Studio Settings (run_web_ui.sh / Docker container)
+# ------------------------------------------------------------------------------
+web_ui:
+  host: "0.0.0.0"               # Bind address (default: 127.0.0.1 locally, 0.0.0.0 in Docker)
+  port: 9001                    # Web server port (default: 9001)
+
+# ------------------------------------------------------------------------------
 # Execution Modes (Optional Defaults)
 # ------------------------------------------------------------------------------
 modes:

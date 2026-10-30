@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import random
 import re
+import shutil
 import sys
 import tempfile
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -662,12 +663,18 @@ def get_profile(
         warmup_bias_lr = 0.0
 
     dep_cfg = cfg.get("deployment", {}) or {}
+    p_dep = p_data.get("deployment", {}) if isinstance(p_data.get("deployment"), dict) else {}
     if target in ("nvidia", "hailo"):
-        deploy_host = str(p_data.get("deploy_host") or "")
-        deploy_dir = str(p_data.get("deploy_dir") or "")
+        deploy_host = str(p_data.get("deploy_host") or p_dep.get("host") or "")
+        deploy_dir = str(p_data.get("deploy_dir") or p_dep.get("dir") or "")
     else:
-        deploy_host = str(p_data.get("deploy_host") or dep_cfg.get("host") or "")
-        deploy_dir = str(p_data.get("deploy_dir") or dep_cfg.get("dir") or "")
+        deploy_host = str(p_data.get("deploy_host") or p_dep.get("host") or dep_cfg.get("host") or "")
+        deploy_dir = str(p_data.get("deploy_dir") or p_dep.get("dir") or dep_cfg.get("dir") or "")
+
+    log_cfg = get_logging_settings(cfg)
+    p_log = p_data.get("logging", {}) if isinstance(p_data.get("logging"), dict) else {}
+    log_console = p_data.get("log_console", p_log.get("console", log_cfg.get("console", True)))
+    log_file = p_data.get("log_file", p_log.get("file", log_cfg.get("file", True)))
 
     fp_cfg = get_frigate_plus_config(cfg)
     frigate_plus_enabled = p_data.get("frigate_plus", fp_cfg["enabled"])
@@ -699,6 +706,8 @@ def get_profile(
         "warmup_bias_lr": warmup_bias_lr,
         "deploy_host": deploy_host,
         "deploy_dir": deploy_dir,
+        "log_console": bool(log_console),
+        "log_file": bool(log_file),
         "frigate_plus": bool(frigate_plus_enabled),
         "frigate_plus_dir": frigate_plus_dir,
     }
@@ -745,8 +754,8 @@ def dump_profile_env(
         f"PROFILE_DEPLOY_DIR={_shell_quote(p['deploy_dir'])}",
         f"PROFILE_FRIGATE_PLUS={_shell_quote('true' if p['frigate_plus'] else 'false')}",
         f"PROFILE_FRIGATE_PLUS_DIR={_shell_quote(p['frigate_plus_dir'])}",
-        f"PROFILE_LOG_CONSOLE={_shell_quote('true' if log_s['console'] else 'false')}",
-        f"PROFILE_LOG_FILE={_shell_quote('true' if log_s['file'] else 'false')}",
+        f"PROFILE_LOG_CONSOLE={_shell_quote('true' if p['log_console'] else 'false')}",
+        f"PROFILE_LOG_FILE={_shell_quote('true' if p['log_file'] else 'false')}",
     ]
     return "\n".join(lines)
 
@@ -1534,6 +1543,128 @@ def setup_logging_from_args(
         log_dir=getattr(args, "log_dir", None),
         target=target or getattr(args, "target", None),
     )
+
+
+def update_config_profiles(
+    profiles_dict: Dict[str, Any],
+    default_profile: Optional[str] = None,
+    config_path: Optional[str] = None,
+) -> None:
+    """Save updated profiles and optional default_profile to config.yaml while preserving comments and non-profile sections."""
+    target_path = Path(config_path or find_config_file())
+    if not target_path.is_file():
+        raise FileNotFoundError(f"Config file not found: {target_path}")
+
+    with open(target_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Update default_profile if provided
+    if default_profile:
+        cleaned_default = default_profile.strip().lower()
+        if re.search(r"^default_profile:\s*.*$", content, flags=re.MULTILINE):
+            content = re.sub(
+                r"^(default_profile:\s*).*$",
+                rf"\g<1>{cleaned_default}",
+                content,
+                flags=re.MULTILINE,
+            )
+        else:
+            content = f"default_profile: {cleaned_default}\n" + content
+
+    dumped_profiles = yaml.safe_dump({"profiles": profiles_dict}, sort_keys=False, default_flow_style=False)
+
+    match = re.search(r"^profiles:\s*$", content, flags=re.MULTILINE)
+    if match:
+        profiles_start = match.start()
+        rest = content[match.end():]
+        next_top_level = re.search(r"^[a-zA-Z0-9_-]+:\s*", rest, flags=re.MULTILINE)
+        if next_top_level:
+            cut_end = match.end() + next_top_level.start()
+            new_content = content[:profiles_start] + dumped_profiles + "\n" + content[cut_end:]
+        else:
+            new_content = content[:profiles_start] + dumped_profiles
+    else:
+        new_content = content.rstrip() + "\n\n" + dumped_profiles
+
+    # Atomic write with backup
+    bak_path = target_path.with_suffix(".yaml.bak")
+    try:
+        shutil.copy2(target_path, bak_path)
+    except Exception:
+        pass
+
+    with open(target_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+
+def save_profile(
+    name: str,
+    profile_data: Dict[str, Any],
+    is_default: bool = False,
+    config_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate, create, or update a named profile in config.yaml."""
+    cleaned_name = name.strip().lower()
+    if not re.match(r"^[a-zA-Z0-9_-]+$", cleaned_name):
+        raise ValueError(
+            f"Invalid profile name '{name}'. Only alphanumeric characters, hyphens, and underscores are allowed."
+        )
+
+    cfg = load_config(config_path)
+    profiles = cfg.get("profiles", {})
+    if not isinstance(profiles, dict):
+        profiles = {}
+
+    profiles[cleaned_name] = profile_data
+    default_name = cleaned_name if is_default else cfg.get("default_profile")
+    update_config_profiles(profiles, default_profile=default_name, config_path=config_path)
+    return {
+        "name": cleaned_name,
+        "default_profile": default_name,
+        "profiles": profiles,
+    }
+
+
+def delete_profile(
+    name: str,
+    config_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Delete a named profile from config.yaml."""
+    cleaned_name = name.strip().lower()
+    cfg = load_config(config_path)
+    profiles = cfg.get("profiles", {})
+    if not isinstance(profiles, dict) or cleaned_name not in profiles:
+        raise ValueError(f"Profile '{name}' does not exist.")
+
+    if len(profiles) <= 1:
+        raise ValueError("Cannot delete the only existing profile.")
+
+    del profiles[cleaned_name]
+    default_name = str(cfg.get("default_profile", "")).strip().lower()
+    if default_name == cleaned_name:
+        default_name = next(iter(profiles.keys()))
+
+    update_config_profiles(profiles, default_profile=default_name, config_path=config_path)
+    return {
+        "deleted": cleaned_name,
+        "default_profile": default_name,
+        "profiles": profiles,
+    }
+
+
+def set_default_profile(
+    name: str,
+    config_path: Optional[str] = None,
+) -> str:
+    """Set the default profile in config.yaml."""
+    cleaned_name = name.strip().lower()
+    cfg = load_config(config_path)
+    profiles = cfg.get("profiles", {})
+    if not isinstance(profiles, dict) or cleaned_name not in profiles:
+        raise ValueError(f"Profile '{name}' does not exist in config.")
+
+    update_config_profiles(profiles, default_profile=cleaned_name, config_path=config_path)
+    return cleaned_name
 
 
 if __name__ == "__main__":

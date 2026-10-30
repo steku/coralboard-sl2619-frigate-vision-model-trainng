@@ -98,23 +98,24 @@ torq-compile --version
 
 ### 4. Optional: Hailo-10H Python 3.10 Environment (`./venv-hailo-310`)
 
-When targeting **Hailo-10H** (`-p hailo` or `-p hailo-spark`), the Hailo Dataflow Compiler (`hailo_dataflow_compiler` v5.3.0) and Hailo Model Zoo (`hailo_model_zoo` v2.19.0) require a dedicated **Python 3.10** virtual environment (`./venv-hailo-310`) and system build libraries:
+When targeting **Hailo-10H** (`-p hailo` or `-p hailo-spark`), the Hailo Dataflow Compiler (`hailo_dataflow_compiler` v5.4.0), HailoRT (`hailort` v5.4.0), and Hailo Model Zoo (`hailo_model_zoo` v5.4.0) require a dedicated **Python 3.10** virtual environment (`./venv-hailo-310`) and system build libraries:
 
 ```bash
 # 1. Install system dependencies and Python 3.10 (or via uv / pyenv)
-sudo apt update && sudo apt install -y graphviz libgraphviz-dev python3-tk
+sudo apt update && sudo apt install -y graphviz libgraphviz-dev python3-tk build-essential
 
 # Create venv-hailo-310 using python3.10 (or: uv venv --python 3.10 venv-hailo-310 --seed)
 python3.10 -m venv venv-hailo-310
 
 # 2. Install build prerequisites and pre-compile lap
 ./venv-hailo-310/bin/pip install --upgrade pip "setuptools<70" wheel cython "numpy<2.0"
-./venv-hailo-310/bin/pip install --no-build-isolation lap==0.4.0
+./venv-hailo-310/bin/pip install --no-build-isolation lap==0.5.12
 
-# 3. Install Hailo Dataflow Compiler and Hailo Model Zoo wheels from packages/
+# 3. Install HailoRT, Hailo Dataflow Compiler, and Hailo Model Zoo wheels from packages/
 ./venv-hailo-310/bin/pip install \
-  packages/hailo_dataflow_compiler-5.3.0-cp310-cp310-linux_x86_64.whl \
-  packages/hailo_model_zoo-2.19.0-py3-none-any.whl
+  packages/hailort-5.4.0-cp310-cp310-linux_x86_64.whl \
+  packages/hailo_dataflow_compiler-5.4.0-py3-none-linux_x86_64.whl \
+  packages/hailo_model_zoo-5.4.0-py3-none-any.whl
 
 # 4. (Optional, for local GPU quantization) Link CUDA libdevice.10.bc into venv root for XLA:
 mkdir -p venv-hailo-310/nvvm/libdevice
@@ -134,6 +135,102 @@ Run the unit test suite to verify configuration parsers, deficit balancing algor
 
 ```bash
 ./venv-torq-312/bin/pytest
+```
+
+---
+
+## Docker Containerization & Compose
+
+A unified multi-environment Docker container ([`Dockerfile`](Dockerfile)) and Docker Compose stack ([`docker-compose.yml`](docker-compose.yml)) are provided to run model training, hardware compilation, and host the web interface with zero host dependencies beyond Docker and the NVIDIA Container Toolkit.
+
+### Multi-Environment Architecture
+- **Base Image**: Multi-stage build based on `nvidia/cuda:12.6.3-runtime-ubuntu24.04` (Ubuntu 24.04 LTS Noble Numbat with GNU C Library `glibc 2.39`), omitting static compiler and developer packages.
+- **Python 3.12 Primary Environment (`/app/venv-torq-312`)**:
+  - Ultralytics YOLOv8 / YOLO26 / YOLOv9 training engine.
+  - PyTorch 2.4.1 + TorchVision 0.19.1 (CUDA 12.1 builds compatible with NVIDIA Pascal `sm_61` through Blackwell).
+  - Synaptics Torq NPU toolchain (`torq-compiler>=2.2.1`, `tosa-converter-for-tflite`, `onnx2tf`).
+  - Frigate Model Training Studio Web Server (`web_ui.py`).
+- **Python 3.10 Hailo Environment (`/app/venv-hailo-310`)**:
+  - Python 3.10 runtime via deadsnakes PPA.
+  - Hailo-10H Dataflow Compiler 5.4.0, HailoRT 5.4.0, and Hailo Model Zoo 5.4.0 installed directly from `packages/*.whl`.
+  - Pre-compiled `lap==0.5.12` and linked CUDA `libdevice.10.bc`.
+
+### Running with Docker Compose
+
+```bash
+# 1. Build the unified container
+docker compose build
+
+# 2. Launch the Web Studio service in detached mode
+docker compose up -d
+
+# 3. View live server logs
+docker compose logs -f
+
+# 4. Stop the container
+docker compose down
+```
+
+Once started, the **Frigate Model Training Studio** is accessible at `http://localhost:9001` (or your host IP).
+
+### Volume Mounts & Persistence
+The Compose stack maps all essential working directories to your local filesystem:
+- `./staging` $\rightarrow$ `/app/staging`: Calibration images, intermediate ONNX graphs, and TFLite tensors.
+- `./logs` $\rightarrow$ `/app/logs`: Training execution logs and phase summaries.
+- `./.web_ui_logs` $\rightarrow$ `/app/.web_ui_logs`: Real-time streaming log buffers for the web interface.
+- `./models` $\rightarrow$ `/app/models`: Persisted model artifacts (`.vmfb`, `.onnx`, `.hef`) and label definitions.
+- `./datasets` $\rightarrow$ `/app/datasets`: YOLO, Frigate+, and COCO reference datasets.
+- `./config.yaml` $\rightarrow$ `/app/config.yaml`: Live configuration parameters.
+- `./.web_ui_history.json` $\rightarrow$ `/app/.web_ui_history.json`: Web UI past run execution records and generated artifact history.
+- `./.processed_events.json` $\rightarrow$ `/app/.processed_events.json`: Frigate harvested event tracking cache.
+- `./.last_cvat_task` $\rightarrow$ `/app/.last_cvat_task`: Last exported/uploaded CVAT task pointer.
+- `~/.ssh` $\rightarrow$ `/root/.ssh:ro`: Local SSH key mount enabling passwordless remote execution on Spark/DGX clusters.
+- `/run/systemd/resolve/stub-resolv.conf` $\rightarrow$ `/etc/resolv.conf:ro`: Host DNS resolver for NetBird VPN peer domain resolution.
+
+The stack utilizes `network_mode: host` to access NetBird VPN interfaces (`wt0`) directly and bind the web interface directly to port 9001.
+
+### Running CLI Commands Inside the Container
+You can execute CLI pipelines directly inside the running container:
+```bash
+docker compose exec frigate-training-studio ./train.sh -p torq --export
+docker compose exec frigate-training-studio ./train.sh -p hailo --compile staging/yolov8m/weights/best.pt
+```
+
+---
+
+## Frigate Model Training Studio (Web Interface)
+
+The repository provides a browser-based graphical user interface ([`web_ui.py`](web_ui.py)) designed for intuitive end-to-end execution and real-time monitoring of model training and compilation.
+
+### Key Capabilities
+- **Turnkey Pipeline Execution**: Start, monitor, or cancel training runs directly from the browser with full CLI parameter parity.
+- **Dynamic CVAT Integration**: Automatically connects to your CVAT instance, queries and displays active annotation tasks/jobs, and allows selecting specific tasks for dataset export with one click.
+- **Profile Presets & Automatic Image Dimensions**: Select profiles (`torq`, `torq-spark`, `hailo`, `hailo-spark`, `nvidia`, etc.) with automatic defaults and target-appropriate input dimensions ($320 \times 320$ for Torq/NVIDIA, $640 \times 640$ for Hailo).
+- **Visual 5-Stage Stepper**: Live visual tracking across the 5 pipeline execution stages:
+  1. `CVAT Export` - Annotation retrieval, class mapping, and dataset partitioning.
+  2. `Pre-training` - Environment verification, profile checks, and remote sync.
+  3. `Model Training` - Local or remote YOLO fine-tuning with live epoch metrics.
+  4. `Compilation` - ONNX normalization, INT8 PTQ quantization, TOSA/Torq or Hailo-10H `.hef` compilation.
+  5. `Deployment` - Transfer to Coralboard/Frigate, service restart, and HTTP health check.
+- **Real-Time Streaming Terminal**: Live Server-Sent Events (SSE) feed terminal output directly to the UI, rendering ANSI colors and updating epoch training/validation progress bars in-place without terminal flickering.
+- **Persistent Resizable Terminal Frame**: Console height can be resized vertically; dimensions are automatically stored in the browser's `localStorage` and preserved across page refreshes.
+- **Persistent Run History**: Inspect previous training runs, view final metrics (mAP50, mAP50-95), timing breakdowns, and download compiled model binaries and logs.
+
+### Launching the Web UI
+
+**Option 1: Using Docker Compose (Recommended)**
+```bash
+docker compose up -d
+# Access at http://localhost:9001
+```
+
+**Option 2: Native Host Execution**
+```bash
+# Using the launcher script (automatically activates venv-torq-312):
+./run_web_ui.sh --host 0.0.0.0 --port 9001
+
+# Or directly with Python:
+python web_ui.py --host 0.0.0.0 --port 9001
 ```
 
 ---
@@ -625,6 +722,12 @@ python report-cvat-balance.py --json
 
 # 16. Compile an existing YOLOv8m checkpoint directly to Hailo-10H (.hef):
 ./train.sh -p hailo --compile staging/yolov8m/weights/best.pt
+
+# 17. Clean generated datasets before training (wipes datasets/yolo & datasets/frigate-plus; keeps COCO intact):
+./train.sh --clean-images
+
+# 18. Standalone deployment of latest compiled model:
+./train.sh --deploy-only root@<CORALBOARD_IP>:/home/root/coralboard-sl2619-vision/models
 ```
 
 #### Artifact Naming, Soft Links & Pipeline Timing Report
@@ -687,9 +790,9 @@ Deploy automatically upon successful compilation:
 ./train.sh
 ```
 
-#### Option B: Standalone Deployment Script (`deploy_to_coralboard.sh`)
+#### Option B: Standalone Deployment Script (`deploy_to_coralboard.sh` / `deploy_to_coralboard.py`)
 
-[`deploy_to_coralboard.sh`](deploy_to_coralboard.sh) manages verification, SCP transfer, systemd service restart via SSH, and post-deployment HTTP health checks:
+[`deploy_to_coralboard.sh`](deploy_to_coralboard.sh) and its Python counterpart [`deploy_to_coralboard.py`](deploy_to_coralboard.py) manage verification, SCP transfer, systemd service restart via SSH, and post-deployment HTTP health checks:
 
 ```bash
 # Deploy, restart service, and verify health:
@@ -968,13 +1071,19 @@ python export-cvat-to-yolo.py --export all --replace
 
 | Script / Component | Description |
 | :--- | :--- |
+| [`web_ui.py`](web_ui.py) | **Frigate Model Training Studio**: Web-based visual dashboard and API server with live SSE logs, CVAT job browser, profile selection, 5-stage stepper, and persistent run history. |
+| [`run_web_ui.sh`](run_web_ui.sh) | **Web Studio Launcher**: Shell script to launch `web_ui.py` in the appropriate Python virtual environment. |
+| [`Dockerfile`](Dockerfile) | **Unified Container Definition**: Multi-environment Docker container (Ubuntu 24.04, CUDA 12.6, Python 3.12 for Torq/Web Studio, Python 3.10 for Hailo-10H DFC 5.4.0). |
+| [`docker-compose.yml`](docker-compose.yml) | **Compose Stack**: Launches Frigate Model Training Studio on port 9001 with filesystem volume mappings and NVIDIA GPU pass-through. |
+| [`train.py`](train.py) | **Core Python Pipeline Orchestrator**: Python implementation of the end-to-end training and compilation pipeline invoked by `train.sh` and the Web UI. |
+| [`train.sh`](train.sh) | **Unified Pipeline Runner**: Shell wrapper around `train.py` automating CVAT export, training (`-p torq-spark`, `-p hailo-spark`), ONNX export, INT8 quantization, Torq `.vmfb` / Hailo `.hef` compilation, deployment, and timing reports. |
 | [`frigate-to-cvat.py`](frigate-to-cvat.py) | **Frigate Harvest & CVAT Upload**: Downloads events from Frigate, creates COCO pre-annotations, and uploads review tasks to CVAT with dynamic deficit balancing. |
 | [`folder-to-cvat.py`](folder-to-cvat.py) | **Folder Image Uploader**: Ingests all images in a local directory with labels from a YAML file and creates a task in CVAT without filtering. |
 | [`report-cvat-balance.py`](report-cvat-balance.py) | **CVAT Dataset Balance Auditor**: Inspects annotation distributions across CVAT tasks/jobs, calculating class deficits, health status, and visual bars. |
-| [`train.sh`](train.sh) | **Unified Pipeline Runner**: Automates CVAT export, local GPU or remote Spark training (`-p torq-spark`, `-p nvidia-spark`, `-p hailo-spark`), ONNX export, INT8 quantization, TOSA/Torq or Hailo-10H `.hef` compilation, deployment, and phase timing reports. |
 | [`config_utils.py`](config_utils.py) | **Configuration, Logging & Shared Evaluation Engine**: Parses `config.yaml`, resolves execution profiles, configures centralized Python `logging` (`models/<timestamp>/logs/`), maps COCO-80 + custom classes, provides shared IoU/ground-truth/dataset-pair evaluation helpers, and dumps shell variables for `train.sh`. |
 | [`export-cvat-to-yolo.py`](export-cvat-to-yolo.py) | **CVAT Exporter**: Connects to CVAT REST API and exports annotations to `datasets/yolo/` with train/val splits and `data.yaml`. |
-| [`deploy_to_coralboard.sh`](deploy_to_coralboard.sh) | **Model Deployer**: Deploys compiled `.vmfb` and `labels.json` to Coralboard locally or via SCP, with optional SSH service restart and HTTP health checks. |
+| [`deploy_to_coralboard.sh`](deploy_to_coralboard.sh) | **Model Deployer (Shell)**: Deploys compiled `.vmfb` and `labels.json` to Coralboard locally or via SCP, with optional SSH service restart and HTTP health checks. |
+| [`deploy_to_coralboard.py`](deploy_to_coralboard.py) | **Model Deployer (Python)**: Standalone Python deployment utility handling file verification, transfer, remote systemd restart, and health probing. |
 | [`test_server_accuracy.py`](test_server_accuracy.py) | **Server Accuracy Benchmark**: Evaluates running vision proxy against dataset images and COCO reference images, measuring precision, recall, F1, and NPU latency. |
 | [`test_nvidia_accuracy.py`](test_nvidia_accuracy.py) | **NVIDIA Model Benchmark**: Evaluates exported ONNX or PyTorch models on CUDA GPU/CPU against dataset, Frigate+, and COCO reference images with latency and mIoU. |
 | [`prepare_for_onnx2tf.py`](prepare_for_onnx2tf.py) | **ONNX & Calibration Helper**: Normalizes ONNX box coordinates, generates class-balanced INT8 calibration `.npy` arrays or Hailo calibration image directories, and writes `labels.json` and Frigate `labels.txt` with soft links. |

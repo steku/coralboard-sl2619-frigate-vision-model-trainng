@@ -102,6 +102,8 @@ cvat_export_temp.zip
 cvat_export_temp_dir/
 .last_cvat_task
 .processed_events.json
+.web_ui_history.json
+.web_ui_logs/
 *.zip
 *.tar
 *.tar.gz
@@ -123,6 +125,8 @@ credentials.json
 config.yaml
 config.yml
 frigate-to-cvat.yaml
+docker-compose-local*
+docker-compose.local*
 !config.example.yaml
 !config.yaml.example
 

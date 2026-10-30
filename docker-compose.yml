@@ -1,0 +1,39 @@
+services:
+  frigate-training-studio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: frigate-model-training:latest
+    container_name: frigate-training-studio
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - HOST=0.0.0.0
+      - PORT=9001
+      - PYTHONUNBUFFERED=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      # Map staging, logging and models to local file system folders
+      - ./staging:/app/staging
+      - ./logs:/app/logs
+      - ./.web_ui_logs:/app/.web_ui_logs
+      - ./models:/app/models
+      # Dataset cache and configuration
+      - ./datasets:/app/datasets
+      - ./config.yaml:/app/config.yaml
+      # Web UI run record history and pipeline state
+      - ./.web_ui_history.json:/app/.web_ui_history.json
+      - ./.processed_events.json:/app/.processed_events.json
+      - ./.last_cvat_task:/app/.last_cvat_task
+      # Mount local SSH keys for passwordless remote execution on Spark
+      - ~/.ssh:/root/.ssh:ro
+      # Mount host systemd-resolved DNS for NetBird VPN peer domain resolution
+      - /run/systemd/resolve/stub-resolv.conf:/etc/resolv.conf:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

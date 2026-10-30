@@ -14,6 +14,7 @@ from pathlib import Path
 import random
 import shutil
 import sys
+from typing import Any, Optional, Union
 
 import cv2
 import numpy as np
@@ -245,28 +246,47 @@ def step3_prepare_calibration(
         low = str(p).lower()
         return "coco" not in low and "val2017" not in low and "train2017" not in low
 
+    def resolve_dataset_dir(raw_path: Any) -> Optional[Path]:
+        p = Path(raw_path)
+        if p.exists() and p.is_dir():
+            return p.resolve()
+        # If path does not exist as-is (e.g. host absolute path inside container),
+        # remap relative to local datasets directory or workspace root
+        if "datasets" in p.parts:
+            idx = p.parts.index("datasets")
+            rel = Path(*p.parts[idx:])
+            if rel.exists() and rel.is_dir():
+                return rel.resolve()
+            if (dataset_root.parent / rel).exists() and (dataset_root.parent / rel).is_dir():
+                return (dataset_root.parent / rel).resolve()
+            if (dataset_root / Path(*p.parts[idx + 1:])).exists() and (dataset_root / Path(*p.parts[idx + 1:])).is_dir():
+                return (dataset_root / Path(*p.parts[idx + 1:])).resolve()
+        cand = dataset_root / p
+        if cand.exists() and cand.is_dir():
+            return cand.resolve()
+        if (Path.cwd() / p).exists() and (Path.cwd() / p).is_dir():
+            return (Path.cwd() / p).resolve()
+        return None
+
     search_dirs = []
     # 1. Primary: surveillance validation directories
     for vd in val_dirs:
-        p_vd = Path(vd)
-        res = p_vd if p_vd.is_absolute() else dataset_root / p_vd
-        if is_surveillance_path(res) and res.exists() and res.is_dir():
+        res = resolve_dataset_dir(vd)
+        if res and is_surveillance_path(res):
             search_dirs.append(res)
 
     # 2. Fallback: surveillance train directories only if no surveillance validation images exist
     if not search_dirs:
         for td in train_dirs:
-            p_td = Path(td)
-            res = p_td if p_td.is_absolute() else dataset_root / p_td
-            if is_surveillance_path(res) and res.exists() and res.is_dir():
+            res = resolve_dataset_dir(td)
+            if res and is_surveillance_path(res):
                 search_dirs.append(res)
 
     # 3. Last-resort fallback to any available directories if no surveillance directories exist
     if not search_dirs:
         for vd in val_dirs:
-            p_vd = Path(vd)
-            res = p_vd if p_vd.is_absolute() else dataset_root / p_vd
-            if res.exists() and res.is_dir():
+            res = resolve_dataset_dir(vd)
+            if res:
                 search_dirs.append(res)
 
     paths = []
@@ -360,6 +380,9 @@ def step3_prepare_calibration(
     np.save(calib_out, calibration)
     print(f"    Calibration array saved to: {calib_out}")
     print(f"    Shape: {calibration.shape}, Dtype: {calibration.dtype}, Range: [{calibration.min():.2f}, {calibration.max():.2f}]")
+
+
+step3_generate_calibration_dataset = step3_prepare_calibration
 
 
 def step4_generate_labels_json(
