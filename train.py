@@ -35,6 +35,22 @@ from deploy_to_coralboard import deploy_artifacts, derive_symlink_name
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
+def ensure_environment_defaults() -> None:
+    """Ensure baseline POSIX user identity and home environment variables exist."""
+    current_user = os.environ.get("USER") or os.environ.get("USERNAME") or os.environ.get("LOGNAME") or "root"
+    for var in ("USER", "USERNAME", "LOGNAME"):
+        if not os.environ.get(var):
+            os.environ[var] = current_user
+    if not os.environ.get("HOME"):
+        try:
+            os.environ["HOME"] = str(Path.home())
+        except Exception:
+            os.environ["HOME"] = "/root"
+
+
+ensure_environment_defaults()
+
+
 def ensure_terminal_onlcr() -> None:
     """Ensure terminal newline translation (onlcr) is restored."""
     if sys.stdin.isatty():
@@ -897,6 +913,11 @@ def main() -> int:
         logger.info("Compiling ONNX to Hailo HEF via hailomz (arch=%s, classes=%d)...", hw_arch, num_classes)
 
         hailo_env = os.environ.copy()
+        current_user = hailo_env.get("USER") or hailo_env.get("USERNAME") or hailo_env.get("LOGNAME") or "root"
+        hailo_env["USER"] = current_user
+        hailo_env["USERNAME"] = current_user
+        hailo_env["LOGNAME"] = current_user
+        hailo_env.setdefault("HOME", "/root")
         hmz_yaml_args = [run_name_stem]
         hailomz_bin = "hailomz"
 
@@ -932,6 +953,14 @@ def main() -> int:
 
             hailo_env["VIRTUAL_ENV"] = str(hailo_venv_abs)
             hailo_env["PATH"] = f"{hailo_venv_abs / 'bin'}:{hailo_env.get('PATH', '')}"
+
+            existing_ld = hailo_env.get("LD_LIBRARY_PATH", "")
+            extra_ld = [
+                str(hailo_venv_abs / "lib"),
+                "/usr/lib",
+                "/usr/local/lib",
+            ]
+            hailo_env["LD_LIBRARY_PATH"] = ":".join(extra_ld + ([existing_ld] if existing_ld else []))
 
             hmz_cfgs = list(hailo_venv_abs.glob("lib/**/hailo_model_zoo/cfg"))
             if hmz_cfgs:

@@ -563,6 +563,56 @@ def test_sse_replace_events_streaming(tmp_path):
         httpd.server_close()
 
 
+def test_sse_clear_event_on_start_run(tmp_path):
+    mgr = web_ui.RunManager(project_root=tmp_path)
+    server_address = ("127.0.0.1", 0)
+    httpd = web_ui.ThreadingStudioServer(server_address, web_ui.StudioHTTPRequestHandler, mgr, "config.yaml")
+    port = httpd.server_address[1]
+
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        mgr.add_log_line("Previous Run Line 1")
+        mgr.add_log_line("Previous Run Line 2")
+
+        received_chunks = []
+        stop_event = threading.Event()
+
+        def stream_reader():
+            req = urllib.request.Request(f"{base_url}/api/logs")
+            with urllib.request.urlopen(req) as resp:
+                while not stop_event.is_set():
+                    line = resp.readline().decode("utf-8")
+                    if not line:
+                        break
+                    received_chunks.append(line)
+
+        reader_thread = threading.Thread(target=stream_reader, daemon=True)
+        reader_thread.start()
+
+        time.sleep(0.2)
+
+        # Start a new run
+        mgr.start_run(["--help"], "default", {})
+        time.sleep(0.2)
+        stop_event.set()
+
+        joined = "".join(received_chunks)
+        assert "event: clear" in joined
+        assert len(mgr.log_buffer) == 0 or all("Previous Run" not in l for l in mgr.log_buffer)
+    finally:
+        if mgr.process:
+            try:
+                mgr.process.terminate()
+            except Exception:
+                pass
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_api_profiles_resolves_imgsz_defaults(tmp_path):
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
@@ -614,10 +664,156 @@ def test_api_profiles_resolves_imgsz_defaults(tmp_path):
             assert "frigate_studio_stream_height" in html
             assert "consoleEl.scrollTop = consoleEl.scrollHeight;" in html
             assert "streamBox.addEventListener(\"scroll\"" in html
+            assert "white-space: pre-wrap;" in html
+            assert "overflow-wrap: anywhere;" in html
+            assert "toggleConsoleWrap" in html
+            assert "stream-wrap-chk" in html
+            assert "hist-wrap-chk" in html
+            assert ".console-box.nowrap" in html
+            assert "@media (max-width: 640px)" in html
+            assert "@media (max-width: 480px)" in html
+            assert "header-container" in html
+            assert "profiles-table-container" in html
+            assert "form-actions" in html
+            assert "collapseSettingsPanes" in html
+            assert "toggleSettingsPanes" in html
+            assert "isMobileWebFormat" in html
+            assert "studio-config-panes" in html
+            assert "banner-toggle-settings-btn" in html
+            assert "banner-abort-btn" in html
+            assert "banner-settings-msg" in html
+            assert "formatDuration" in html
+            assert "${hrs}h ${mins}m ${secs}s" in html
             assert 'id="step-pretrain"' in html
+            # Queue UI elements
+            assert 'id="queue-mode-banner"' in html
+            assert 'id="queued-run-card"' in html
+            assert 'id="queue-action-buttons"' in html
+            assert 'id="queue-next-btn"' in html
+            assert 'id="banner-queue-btn"' in html
+            assert "enterQueueMode" in html
+            assert "exitQueueMode" in html
+            assert "submitQueuedRun" in html
+            assert "cancelQueuedRun" in html
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_run_manager_queue_flow(tmp_path):
+    mgr = web_ui.RunManager(project_root=tmp_path)
+    initial_history_len = len(mgr.history)
+
+    # 1. When idle, queue_run with a command starts immediately
+    dummy_script = tmp_path / "train.py"
+    dummy_script.write_text("import sys, time; time.sleep(0.8); sys.exit(0)")
+
+    cmd_args = ["-p", "torq", "--epochs", "5"]
+    success, action, item = mgr.queue_run(cmd_args, "torq", {"profile": "torq", "epochs": 5})
+    assert success is True
+    assert action == "started"
+    assert mgr.is_running() is True
+
+    # 2. While running, queueing another run should queue it
+    next_args = ["-p", "hailo", "--epochs", "10"]
+    success2, action2, item2 = mgr.queue_run(next_args, "hailo", {"profile": "hailo", "epochs": 10})
+    assert success2 is True
+    assert action2 == "queued"
+    assert item2["queue_id"] == "q-1"
+    assert len(mgr.queue) == 1
+
+    # Verify get_status includes queue
+    st = mgr.get_status()
+    assert len(st["queue"]) == 1
+    assert st["queue"][0]["queue_id"] == "q-1"
+
+    # 3. Update the queued run in place
+    updated_args = ["-p", "hailo", "--epochs", "20"]
+    success_up, action_up, item_up = mgr.queue_run(updated_args, "hailo", {"profile": "hailo", "epochs": 20}, queue_id="q-1")
+    assert success_up is True
+    assert action_up == "updated"
+    assert mgr.queue[0]["options"]["epochs"] == 20
+
+    # 4. Wait for the active run to finish; queued run should auto-start
+    # First run takes 0.8s. Wait 1.0s.
+    time.sleep(1.0)
+    # The first run completed and q-1 auto-started
+    assert mgr.is_running() is True
+    assert mgr.active_run["profile"] == "hailo"
+    assert len(mgr.queue) == 0
+    assert len(mgr.history) == initial_history_len + 1
+    assert mgr.history[-1]["profile"] == "torq"
+
+    # Clean up active process
+    mgr.abort_run()
+
+
+def test_queue_api_endpoints(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("""
+default_profile: torq
+profiles:
+  torq:
+    target: torq
+    base_model: yolov8n.pt
+    epochs: 10
+""")
+
+    run_manager = web_ui.RunManager(project_root=tmp_path)
+    # Simulate an active run so queue endpoint puts it in queue
+    run_manager.process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    run_manager.active_run = {
+        "run_id": "test_active",
+        "profile": "torq",
+        "start_time": time.time(),
+        "stages": {},
+    }
+
+    server_address = ("127.0.0.1", 0)
+    httpd = web_ui.ThreadingStudioServer(server_address, web_ui.StudioHTTPRequestHandler, run_manager, str(config_file))
+    port = httpd.server_address[1]
+
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        # POST /api/queue
+        payload = json.dumps({"profile": "torq", "epochs": 25, "workflow": "full"}).encode("utf-8")
+        req = urllib.request.Request(f"{base_url}/api/queue", data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+            res_data = json.loads(resp.read().decode("utf-8"))
+            assert res_data["ok"] is True
+            assert res_data["action"] == "queued"
+            queue_id = res_data["item"]["queue_id"]
+
+        # GET /api/queue
+        req_get = urllib.request.Request(f"{base_url}/api/queue")
+        with urllib.request.urlopen(req_get) as resp:
+            assert resp.status == 200
+            q_data = json.loads(resp.read().decode("utf-8"))
+            assert q_data["ok"] is True
+            assert len(q_data["queue"]) == 1
+            assert q_data["queue"][0]["queue_id"] == queue_id
+
+        # POST /api/queue/cancel
+        cancel_payload = json.dumps({"queue_id": queue_id}).encode("utf-8")
+        req_cancel = urllib.request.Request(f"{base_url}/api/queue/cancel", data=cancel_payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req_cancel) as resp:
+            assert resp.status == 200
+            cancel_res = json.loads(resp.read().decode("utf-8"))
+            assert cancel_res["ok"] is True
+
+        # Verify queue is now empty
+        assert len(run_manager.queue) == 0
+
+    finally:
+        run_manager.abort_run()
+        httpd.shutdown()
+        httpd.server_close()
+
 
 
 

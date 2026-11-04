@@ -11,6 +11,10 @@ services:
       - HOST=0.0.0.0
       - PORT=9001
       - PYTHONUNBUFFERED=1
+      - USER=root
+      - USERNAME=root
+      - LOGNAME=root
+      - HOME=/root
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:

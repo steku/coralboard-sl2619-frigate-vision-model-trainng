@@ -71,6 +71,8 @@ class RunManager:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.current_log_file = None
         self._pending_log_file_line: Optional[str] = None
+        self.queue: List[Dict[str, Any]] = []
+        self._queue_counter: int = 1
 
     def _load_history(self) -> List[Dict[str, Any]]:
         if HISTORY_FILE.is_file():
@@ -193,12 +195,22 @@ class RunManager:
 
     def get_status(self) -> Dict[str, Any]:
         with self.lock:
+            queue_snapshot = [
+                {
+                    "queue_id": item["queue_id"],
+                    "profile": item["profile"],
+                    "options": item["options"],
+                    "queued_at_iso": item.get("queued_at_iso", ""),
+                }
+                for item in self.queue
+            ]
             if not self.active_run:
                 return {
                     "running": False,
                     "status": "idle",
                     "history": self.history,
                     "stages": {s["id"]: "pending" for s in PIPELINE_STAGES},
+                    "queue": queue_snapshot,
                 }
 
             is_alive = self.process is not None and self.process.poll() is None
@@ -214,7 +226,97 @@ class RunManager:
                 "artifacts": self.active_run.get("artifacts", []),
                 "options": self.active_run.get("options", {}),
                 "history": self.history,
+                "queue": queue_snapshot,
             }
+
+    def get_queued_runs(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return [
+                {
+                    "queue_id": item["queue_id"],
+                    "profile": item["profile"],
+                    "options": item["options"],
+                    "cmd_args": item.get("cmd_args", []),
+                    "queued_at_iso": item.get("queued_at_iso", ""),
+                }
+                for item in self.queue
+            ]
+
+    def queue_run(
+        self,
+        cmd_args: List[str],
+        profile_name: str,
+        options_summary: Dict[str, Any],
+        queue_id: Optional[str] = None,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        with self.lock:
+            is_active = self.process is not None and self.process.poll() is None
+
+            # If editing an existing queue item:
+            if queue_id:
+                for item in self.queue:
+                    if item.get("queue_id") == queue_id:
+                        item["profile"] = profile_name
+                        item["cmd_args"] = cmd_args
+                        item["options"] = options_summary
+                        item["updated_at_iso"] = datetime.datetime.now().isoformat()
+                        return True, "updated", item
+                item = {
+                    "queue_id": queue_id,
+                    "profile": profile_name,
+                    "cmd_args": cmd_args,
+                    "options": options_summary,
+                    "queued_at_iso": datetime.datetime.now().isoformat(),
+                }
+                self.queue.append(item)
+                return True, "queued", item
+
+            # If idle and queue empty, start immediately below
+            if not is_active and not self.queue:
+                pass
+            else:
+                qid = f"q-{self._queue_counter}"
+                self._queue_counter += 1
+                item = {
+                    "queue_id": qid,
+                    "profile": profile_name,
+                    "cmd_args": cmd_args,
+                    "options": options_summary,
+                    "queued_at_iso": datetime.datetime.now().isoformat(),
+                }
+                self.queue.append(item)
+                return True, "queued", item
+
+        # Start immediately if idle
+        started, run_id = self.start_run(cmd_args, profile_name, options_summary)
+        if started:
+            return True, "started", {"run_id": run_id}
+        else:
+            return False, run_id, {}
+
+    def cancel_queued_run(self, queue_id: Optional[str] = None) -> Tuple[bool, str]:
+        with self.lock:
+            if not self.queue:
+                return False, "No queued runs found."
+            if queue_id:
+                initial_len = len(self.queue)
+                self.queue = [item for item in self.queue if item.get("queue_id") != queue_id]
+                if len(self.queue) < initial_len:
+                    return True, f"Queued run '{queue_id}' cancelled."
+                return False, f"Queued run '{queue_id}' not found."
+            else:
+                removed = self.queue.pop(0)
+                return True, f"Queued run '{removed.get('queue_id')}' cancelled."
+
+    def start_next_queued_run(self) -> Tuple[bool, str]:
+        with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                return False, "A training run is currently active. The queued run will start automatically when it finishes."
+            if not self.queue:
+                return False, "No queued runs available."
+            next_run = self.queue.pop(0)
+
+        return self.start_run(next_run["cmd_args"], next_run["profile"], next_run["options"])
 
     def start_run(self, cmd_args: List[str], profile_name: str, options_summary: Dict[str, Any]) -> Tuple[bool, str]:
         with self.lock:
@@ -224,7 +326,15 @@ class RunManager:
             run_id = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
             self.log_buffer.clear()
             self._pending_log_file_line = None
+            subscribers_snapshot = list(self.subscribers)
 
+        for q in subscribers_snapshot:
+            try:
+                q.put_nowait(("", "clear"))
+            except queue.Full:
+                pass
+
+        with self.lock:
             stages = {}
             for s in PIPELINE_STAGES:
                 stages[s["id"]] = "pending"
@@ -263,6 +373,11 @@ class RunManager:
 
             proc_env = os.environ.copy()
             proc_env["PYTHONUNBUFFERED"] = "1"
+            current_user = proc_env.get("USER") or proc_env.get("USERNAME") or proc_env.get("LOGNAME") or "root"
+            proc_env["USER"] = current_user
+            proc_env["USERNAME"] = current_user
+            proc_env["LOGNAME"] = current_user
+            proc_env.setdefault("HOME", "/root")
 
             try:
                 self.process = subprocess.Popen(
@@ -360,8 +475,12 @@ class RunManager:
         end_time = time.time()
         elapsed = int(end_time - run_info["start_time"])
 
+        next_run_to_start = None
         with self.lock:
-            final_status = "completed" if return_code == 0 else ("aborted" if return_code in (-signal.SIGINT, -signal.SIGTERM, 130, 143) else "failed")
+            is_aborted = (run_info.get("status") == "aborting") or (
+                return_code in (-signal.SIGINT, -signal.SIGTERM, getattr(signal, "SIGKILL", 9), -getattr(signal, "SIGKILL", 9), 130, 143, 137)
+            )
+            final_status = "aborted" if is_aborted else ("completed" if return_code == 0 else "failed")
             run_info["status"] = final_status
             run_info["return_code"] = return_code
             run_info["elapsed_sec"] = elapsed
@@ -386,6 +505,17 @@ class RunManager:
                 "return_code": return_code,
             })
             self._save_history()
+
+            if final_status != "aborted" and self.queue:
+                next_run_to_start = self.queue.pop(0)
+
+        if next_run_to_start:
+            self.add_log_line(
+                f"[QUEUE] Active run finished ({final_status}). Auto-starting next queued run: profile '{next_run_to_start['profile']}' (Queue ID: {next_run_to_start['queue_id']})..."
+            )
+            self.start_run(next_run_to_start["cmd_args"], next_run_to_start["profile"], next_run_to_start["options"])
+        elif final_status == "aborted" and self.queue:
+            self.add_log_line("[QUEUE] Active run was aborted. Queued runs held in queue.")
 
     def _discover_artifacts(self) -> List[Dict[str, str]]:
         found = []
@@ -413,17 +543,26 @@ class RunManager:
                 self.active_run["status"] = "aborting"
 
         try:
+            pgid = None
             if hasattr(os, "killpg") and hasattr(os, "getpgid"):
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                try:
+                    p_pgid = os.getpgid(proc.pid)
+                    if p_pgid == proc.pid:
+                        pgid = p_pgid
+                except Exception:
+                    pass
+
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
             else:
                 proc.terminate()
             time.sleep(0.5)
             if proc.poll() is None:
-                if hasattr(os, "killpg") and hasattr(os, "getpgid"):
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
                 else:
                     proc.kill()
-            self.add_log_line("[WEB_UI] Training run was aborted by user.")
+            self.add_log_line("[WEB_UI] Training run was aborted by user. Queued runs held in queue.")
             return True, "Training run stopped successfully."
         except Exception as e:
             return False, f"Error stopping process: {e}"
@@ -831,6 +970,7 @@ def get_html_content() -> str:
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       line-height: 1.5;
       padding: 1.5rem;
+      overflow-x: hidden;
     }
     header {
       display: flex;
@@ -884,9 +1024,11 @@ def get_html_content() -> str:
     .badge-completed { background: rgba(34, 197, 94, 0.2); color: var(--success); border: 1px solid var(--success); }
     .badge-failed { background: rgba(239, 68, 68, 0.2); color: var(--danger); border: 1px solid var(--danger); }
     .badge-aborted { background: rgba(245, 158, 11, 0.2); color: var(--warning); border: 1px solid var(--warning); }
+    .badge-queued { background: rgba(16, 185, 129, 0.2); color: var(--success); border: 1px solid var(--success); }
 
-    .grid { display: grid; grid-template-columns: 460px 1fr; gap: 1.5rem; }
-    @media (max-width: 1080px) { .grid { grid-template-columns: 1fr; } }
+    .grid { display: grid; grid-template-columns: 460px minmax(0, 1fr); gap: 1.5rem; }
+    @media (max-width: 1080px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+    .grid > div { min-width: 0; max-width: 100%; }
 
     .card {
       background: var(--card-bg);
@@ -894,6 +1036,8 @@ def get_html_content() -> str:
       border-radius: 0.75rem;
       padding: 1.25rem;
       margin-bottom: 1.25rem;
+      min-width: 0;
+      max-width: 100%;
     }
     .card h2 { font-size: 1.05rem; margin-bottom: 0.85rem; color: #e2e8f0; display: flex; align-items: center; justify-content: space-between; }
 
@@ -943,6 +1087,8 @@ def get_html_content() -> str:
     .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
     .btn-danger { background: var(--danger); color: white; }
     .btn-danger:hover:not(:disabled) { background: #dc2626; }
+    .btn-success { background: var(--success); color: #022c22; font-weight: 700; }
+    .btn-success:hover:not(:disabled) { background: #16a34a; }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
     /* CVAT task checklist box */
@@ -1005,8 +1151,18 @@ def get_html_content() -> str:
       padding: 0.75rem 1rem;
       font-family: var(--font-mono);
       font-size: 0.825rem;
-      white-space: pre;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      max-width: 100%;
+      box-sizing: border-box;
       color: #e2e8f0;
+    }
+    .console-box.nowrap {
+      white-space: pre !important;
+      word-break: normal !important;
+      overflow-wrap: normal !important;
+      overflow-x: auto !important;
     }
     .console-box p { margin: 0.15rem 0; line-height: 1.35; }
 
@@ -1044,19 +1200,67 @@ def get_html_content() -> str:
     .profiles-table th, .profiles-table td { text-align: left; padding: 0.65rem 0.75rem; border-bottom: 1px solid var(--card-border); }
     .profiles-table thead th { color: var(--text-muted); font-weight: 600; background: #090d16; }
     .default-star { color: #f59e0b; margin-left: 0.35rem; font-size: 0.9rem; }
+
+    /* Header & Navigation Layout */
+    .header-container { display: flex; align-items: center; justify-content: space-between; width: 100%; flex-wrap: wrap; gap: 0.75rem; }
+    .header-left { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+    .header-right { display: flex; align-items: center; gap: 0.5rem; }
+    .form-actions { display: flex; gap: 0.75rem; margin-top: 1.5rem; }
+
+    /* Responsive Styles - Tablets and Mobile Phones */
+    @media (max-width: 768px) {
+      body { padding: 0.75rem; }
+      header { margin-bottom: 1rem; padding-bottom: 0.75rem; }
+      .grid { gap: 1rem; }
+      .card { padding: 1rem; margin-bottom: 1rem; }
+      .stepper { grid-template-columns: repeat(3, 1fr); gap: 0.4rem; }
+      .step-item { padding: 0.5rem 0.25rem; font-size: 0.75rem; }
+      .history-scroll-container, .profiles-table-container { -webkit-overflow-scrolling: touch; }
+      .history-table { min-width: 520px; }
+      .profiles-table { min-width: 620px; }
+    }
+
+    @media (max-width: 640px) {
+      .header-container { flex-direction: column; align-items: flex-start; }
+      .header-left { width: 100%; flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+      .header-right { width: 100%; justify-content: space-between; }
+      .nav-tabs { width: 100%; display: flex; }
+      .nav-tab { flex: 1; text-align: center; }
+      .console-header { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+      .console-controls { width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; }
+      .hist-logs-header { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+      #hist-logs-meta { width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.5rem; }
+      .console-box { height: 320px; min-height: 140px; font-size: 0.75rem; padding: 0.5rem 0.65rem; }
+      input[type="text"], input[type="number"], select { font-size: 16px; padding: 0.55rem 0.65rem; }
+      .btn { min-height: 44px; }
+    }
+
+    @media (max-width: 480px) {
+      body { padding: 0.5rem; }
+      h1 { font-size: 1.15rem; }
+      .card { padding: 0.75rem; border-radius: 0.5rem; }
+      .card h2 { font-size: 0.95rem; }
+      .stepper { grid-template-columns: repeat(2, 1fr); gap: 0.35rem; }
+      .step-item:last-child { grid-column: span 2; }
+      .step-item { padding: 0.45rem 0.2rem; font-size: 0.7rem; }
+      .nav-tab { padding: 0.45rem 0.4rem; font-size: 0.8rem; }
+      .form-actions { flex-direction: column; }
+      .form-actions .btn { width: 100% !important; }
+      .console-box { height: 280px; }
+    }
   </style>
 </head>
 <body>
   <header>
-    <div style="display: flex; align-items: center; justify-content: space-between; width: 100%; flex-wrap: wrap; gap: 1rem;">
-      <div style="display: flex; align-items: center; gap: 1.25rem; flex-wrap: wrap;">
+    <div class="header-container">
+      <div class="header-left">
         <h1 style="margin: 0;">Frigate Model Training Studio</h1>
         <nav class="nav-tabs">
           <button id="nav-btn-studio" class="nav-tab active" onclick="switchView('studio')">🚀 Training Studio</button>
           <button id="nav-btn-settings" class="nav-tab" onclick="switchView('settings')">⚙️ Settings &amp; Profiles</button>
         </nav>
       </div>
-      <div>
+      <div class="header-right">
         <span id="status-badge" class="badge badge-idle">Idle</span>
         <span id="elapsed-time" style="font-size: 0.85rem; color: var(--text-muted); margin-left: 0.5rem;"></span>
       </div>
@@ -1067,13 +1271,55 @@ def get_html_content() -> str:
   <div id="view-studio" class="view-panel">
     <div class="grid">
       <!-- Left Column: Controls & Configuration -->
-      <div>
-        <div id="active-run-banner" style="display: none; background: rgba(56, 189, 248, 0.15); border: 1px solid var(--primary); padding: 0.6rem 0.8rem; border-radius: 0.5rem; font-size: 0.85rem; color: var(--primary); margin-bottom: 1rem;">
-          Active training job in progress &mdash; form options restored from running job.
+      <div id="studio-left-col">
+        <div id="active-run-banner" style="display: none; background: rgba(56, 189, 248, 0.15); border: 1px solid var(--primary); padding: 0.65rem 0.85rem; border-radius: 0.5rem; font-size: 0.85rem; color: var(--primary); margin-bottom: 1rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+            <div>
+              <strong>Active training job in progress</strong><span id="banner-settings-msg" style="display: none;"> &mdash; settings collapsed for log visibility</span>.
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+              <button id="banner-queue-btn" class="btn btn-sm" type="button" onclick="enterQueueMode()" style="background: rgba(16, 185, 129, 0.2); border: 1px solid var(--success); color: var(--success); font-weight: 600;">+ Setup Next Run</button>
+              <button id="banner-toggle-settings-btn" class="btn btn-sm" type="button" onclick="toggleSettingsPanes()">Show Settings</button>
+              <button id="banner-abort-btn" class="btn btn-sm btn-danger" type="button" onclick="abortTraining()">Abort Run</button>
+            </div>
+          </div>
         </div>
 
-        <!-- Profile & Workflow -->
-        <div class="card">
+        <div id="queue-mode-banner" style="display: none; background: rgba(16, 185, 129, 0.15); border: 1px solid var(--success); padding: 0.65rem 0.85rem; border-radius: 0.5rem; font-size: 0.85rem; color: var(--success); margin-bottom: 1rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+            <div>
+              <strong id="queue-mode-title">📋 Setup Next Model Run (Queued)</strong> &mdash; <span>Configure model options below. It will automatically start when the current run finishes.</span>
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+              <button class="btn btn-sm btn-success" type="button" onclick="submitQueuedRun()">Save to Queue</button>
+              <button class="btn btn-sm" type="button" onclick="exitQueueMode()">Back to Active Run</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="queued-run-card" class="card" style="display: none; border: 1px solid var(--success); background: rgba(16, 185, 129, 0.08); margin-bottom: 1rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem;">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="badge badge-queued">QUEUED NEXT</span>
+              <h2 style="margin: 0; font-size: 0.95rem; border: none; padding: 0; display: inline;">
+                Run <span id="queued-run-id-label">#q-1</span> (<span id="queued-run-profile-label">torq</span>)
+              </h2>
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+              <button id="queued-start-now-btn" class="btn btn-sm btn-success" type="button" style="display: none;" onclick="startQueuedRunNow()">▶️ Start Run Now</button>
+              <button class="btn btn-sm" type="button" onclick="editQueuedRun()">✏️ Edit Options</button>
+              <button class="btn btn-sm btn-danger" type="button" onclick="cancelQueuedRun()">🗑️ Cancel Queue</button>
+            </div>
+          </div>
+          <div id="queued-run-summary" style="font-size: 0.825rem; color: #cbd5e1; line-height: 1.5;"></div>
+          <div id="queued-run-status-notice" style="margin-top: 0.4rem; font-size: 0.8rem; color: var(--success); display: flex; align-items: center; gap: 0.4rem;">
+            <span>⏳ Will automatically start when current pipeline execution completes.</span>
+          </div>
+        </div>
+
+        <div id="studio-config-panes">
+          <!-- Profile & Workflow -->
+          <div class="card">
           <h2>Execution Profile &amp; Workflow</h2>
           <div class="form-group">
             <label for="profile-select">Target Profile</label>
@@ -1256,11 +1502,19 @@ def get_html_content() -> str:
             </div>
           </div>
         </div>
+        </div><!-- end #studio-config-panes -->
 
         <!-- Action Buttons -->
-        <div class="card">
-          <button id="start-btn" class="btn btn-primary" onclick="startTraining()">Start Pipeline Execution</button>
-          <button id="abort-btn" class="btn btn-danger" style="display: none; margin-top: 0.75rem;" onclick="abortTraining()">Abort Active Run</button>
+        <div id="action-buttons-card" class="card">
+          <div id="normal-action-buttons">
+            <button id="start-btn" class="btn btn-primary" onclick="startTraining()">Start Pipeline Execution</button>
+            <button id="queue-next-btn" class="btn" type="button" style="display: none; background: rgba(16, 185, 129, 0.2); border: 1px solid var(--success); color: var(--success); font-weight: 600; width: 100%; margin-top: 0.75rem;" onclick="enterQueueMode()">+ Setup &amp; Queue Next Run</button>
+            <button id="abort-btn" class="btn btn-danger" style="display: none; margin-top: 0.75rem;" onclick="abortTraining()">Abort Active Run</button>
+          </div>
+          <div id="queue-action-buttons" style="display: none; flex-direction: column; gap: 0.5rem;">
+            <button id="btn-submit-queue" class="btn btn-success" type="button" onclick="submitQueuedRun()">Queue Model Run (Starts After Current Run)</button>
+            <button class="btn" type="button" style="background: transparent; border: 1px solid var(--card-border);" onclick="exitQueueMode()">Cancel &amp; Return to Active Run</button>
+          </div>
         </div>
       </div>
 
@@ -1280,8 +1534,11 @@ def get_html_content() -> str:
         <div class="card">
           <div class="console-header">
             <h2>Process Log Stream</h2>
-            <div style="display: flex; gap: 0.5rem; align-items: center;">
-              <label style="margin: 0; font-size: 0.8rem; display: flex; align-items: center; gap: 0.25rem;">
+            <div class="console-controls" style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
+              <label style="margin: 0; font-size: 0.8rem; display: flex; align-items: center; gap: 0.25rem; cursor: pointer;">
+                <input type="checkbox" id="stream-wrap-chk" checked onchange="toggleConsoleWrap('console-stream', this.checked)"> Wrap lines
+              </label>
+              <label style="margin: 0; font-size: 0.8rem; display: flex; align-items: center; gap: 0.25rem; cursor: pointer;">
                 <input type="checkbox" id="autoscroll-chk" checked> Autoscroll
               </label>
               <button class="btn" style="padding: 0.25rem 0.5rem; font-size: 0.75rem; width: auto;" onclick="clearConsole()">Clear</button>
@@ -1316,12 +1573,15 @@ def get_html_content() -> str:
 
         <!-- Frame below run record & artifact history for clicked run logs -->
         <div id="historical-logs-card" class="card" style="margin-top: 1.25rem;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem;">
+          <div class="hist-logs-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 0.5rem;">
             <div style="display: flex; align-items: center; gap: 0.75rem;">
               <h2 style="margin: 0; font-size: 1.05rem;" id="hist-logs-title">Execution Log Viewer</h2>
               <span id="hist-logs-badge" class="badge" style="display: none;"></span>
             </div>
-            <div id="hist-logs-meta" style="display: flex; gap: 0.5rem; align-items: center; font-size: 0.825rem; color: var(--text-muted);">
+            <div id="hist-logs-meta" style="display: flex; gap: 0.75rem; align-items: center; font-size: 0.825rem; color: var(--text-muted);">
+              <label style="margin: 0; font-size: 0.8rem; display: flex; align-items: center; gap: 0.25rem; cursor: pointer;">
+                <input type="checkbox" id="hist-wrap-chk" checked onchange="toggleConsoleWrap('hist-console', this.checked)"> Wrap lines
+              </label>
               <span id="hist-logs-hint">Click a run record above to inspect its execution logs</span>
               <button id="hist-close-btn" class="btn btn-sm" style="display: none;" onclick="closeHistoryLogs()">Close</button>
             </div>
@@ -1347,7 +1607,7 @@ def get_html_content() -> str:
         </div>
         <button class="btn btn-primary" style="width: auto; padding: 0.5rem 1rem;" onclick="createNewProfileForm()">+ Create New Profile</button>
       </div>
-      <div style="overflow-x: auto;">
+      <div class="profiles-table-container" style="overflow-x: auto;">
         <table class="profiles-table">
           <thead>
             <tr>
@@ -1531,7 +1791,7 @@ def get_html_content() -> str:
           </div>
         </div>
 
-        <div style="display: flex; gap: 0.75rem; margin-top: 1.5rem;">
+        <div class="form-actions" style="display: flex; gap: 0.75rem; margin-top: 1.5rem;">
           <button type="submit" class="btn btn-primary" style="width: auto; padding: 0.6rem 1.5rem;">💾 Save Profile</button>
           <button type="button" class="btn" style="width: auto; padding: 0.6rem 1.5rem; background: #334155; color: #e2e8f0;" onclick="resetProfileForm()">Cancel</button>
         </div>
@@ -1542,10 +1802,61 @@ def get_html_content() -> str:
   <script>
     let profilesData = {};
     let isRunning = false;
+    let wasRunning = false;
+    let isSettingsCollapsed = false;
+    let userManuallyToggledSettings = false;
     let sseSource = null;
     let cvatTasksList = [];
     let currentActiveRunId = null;
+    let lastSeenRunId = null;
     let selectedHistoryRunId = null;
+    let formMode = "normal";
+    let editingQueueId = null;
+    let cachedActiveRunOptions = null;
+    let currentQueue = [];
+
+    function isMobileWebFormat() {
+      return window.matchMedia("(max-width: 1080px)").matches || window.innerWidth <= 1080;
+    }
+
+    function formatDuration(totalSec) {
+      const s = Math.max(0, Math.floor(Number(totalSec) || 0));
+      const hrs = Math.floor(s / 3600);
+      const mins = Math.floor((s % 3600) / 60);
+      const secs = s % 60;
+      return `${hrs}h ${mins}m ${secs}s`;
+    }
+
+    function collapseSettingsPanes(collapse) {
+      isSettingsCollapsed = collapse;
+      const panes = document.getElementById("studio-config-panes");
+      const actionsCard = document.getElementById("action-buttons-card");
+      const bannerBtn = document.getElementById("banner-toggle-settings-btn");
+      const bannerMsg = document.getElementById("banner-settings-msg");
+      if (panes) {
+        panes.style.display = collapse ? "none" : "block";
+      }
+      if (actionsCard) {
+        actionsCard.style.display = (collapse && isRunning) ? "none" : "block";
+      }
+      if (bannerBtn) {
+        bannerBtn.textContent = collapse ? "Show Settings" : "Hide Settings";
+      }
+      if (bannerMsg) {
+        bannerMsg.style.display = collapse ? "inline" : "none";
+      }
+      if (collapse && isMobileWebFormat()) {
+        const streamBox = document.getElementById("console-stream");
+        if (streamBox) {
+          streamBox.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+      }
+    }
+
+    function toggleSettingsPanes() {
+      userManuallyToggledSettings = true;
+      collapseSettingsPanes(!isSettingsCollapsed);
+    }
 
     async function init() {
       setupTerminal();
@@ -1556,12 +1867,19 @@ def get_html_content() -> str:
       try {
         const statusRes = await fetch("/api/status");
         const statusData = await statusRes.json();
+        if (statusData.running && isMobileWebFormat()) {
+          collapseSettingsPanes(true);
+        }
         if (statusData.running && statusData.options && Object.keys(statusData.options).length > 0) {
           currentActiveRunId = statusData.run_id;
+          cachedActiveRunOptions = statusData.options;
           populateFormFromOptions(statusData.options);
           setFormInputsDisabled(true);
         } else if (profilesData.default_profile) {
           loadProfileDefaults(profilesData.default_profile);
+        }
+        if (statusData && statusData.run_id) {
+          lastSeenRunId = statusData.run_id;
         }
         updateUIState(statusData);
       } catch (err) {
@@ -1576,6 +1894,16 @@ def get_html_content() -> str:
       if (window.location.hash === "#settings") {
         switchView("settings");
       }
+
+      window.addEventListener("resize", () => {
+        if (isRunning && !userManuallyToggledSettings) {
+          if (isMobileWebFormat() && !isSettingsCollapsed) {
+            collapseSettingsPanes(true);
+          } else if (!isMobileWebFormat() && isSettingsCollapsed) {
+            collapseSettingsPanes(false);
+          }
+        }
+      });
 
       setInterval(pollStatus, 3000);
     }
@@ -2078,6 +2406,19 @@ def get_html_content() -> str:
       if (log.file !== undefined) document.getElementById("log-file").checked = !!log.file;
     }
 
+    function toggleConsoleWrap(boxId, wrap) {
+      const box = document.getElementById(boxId);
+      if (!box) return;
+      if (wrap) {
+        box.classList.remove("nowrap");
+      } else {
+        box.classList.add("nowrap");
+      }
+      try {
+        localStorage.setItem(`frigate_studio_${boxId}_wrap`, wrap ? "1" : "0");
+      } catch (e) {}
+    }
+
     function setupTerminal() {
       const streamBox = document.getElementById("console-stream");
       const histBox = document.getElementById("hist-console");
@@ -2091,8 +2432,23 @@ def get_html_content() -> str:
         if (savedHistHeight && histBox) {
           histBox.style.height = savedHistHeight;
         }
+
+        const streamWrap = localStorage.getItem("frigate_studio_console-stream_wrap");
+        const streamWrapChk = document.getElementById("stream-wrap-chk");
+        if (streamWrap !== null && streamWrapChk) {
+          const isWrap = streamWrap === "1";
+          streamWrapChk.checked = isWrap;
+          toggleConsoleWrap("console-stream", isWrap);
+        }
+        const histWrap = localStorage.getItem("frigate_studio_hist-console_wrap");
+        const histWrapChk = document.getElementById("hist-wrap-chk");
+        if (histWrap !== null && histWrapChk) {
+          const isWrap = histWrap === "1";
+          histWrapChk.checked = isWrap;
+          toggleConsoleWrap("hist-console", isWrap);
+        }
       } catch (e) {
-        console.warn("Could not load stored logging frame sizes:", e);
+        console.warn("Could not load stored logging frame sizes or wrap preferences:", e);
       }
 
       if (window.ResizeObserver) {
@@ -2131,6 +2487,10 @@ def get_html_content() -> str:
     function setupSSE() {
       if (sseSource) sseSource.close();
       sseSource = new EventSource("/api/logs");
+
+      sseSource.addEventListener("clear", () => {
+        clearConsole();
+      });
 
       sseSource.addEventListener("replace", (e) => {
         if (!e.data || e.data.startsWith(":")) return;
@@ -2188,35 +2548,121 @@ def get_html_content() -> str:
     }
 
     function updateUIState(data) {
+      const previouslyRunning = wasRunning;
       isRunning = !!data.running;
+      wasRunning = isRunning;
+      currentQueue = data.queue || [];
+
+      if (data.run_id) {
+        if (lastSeenRunId !== null && lastSeenRunId !== data.run_id) {
+          clearConsole();
+        }
+        lastSeenRunId = data.run_id;
+      }
+
       const badge = document.getElementById("status-badge");
       const startBtn = document.getElementById("start-btn");
       const abortBtn = document.getElementById("abort-btn");
       const elapsedSpan = document.getElementById("elapsed-time");
+      const banner = document.getElementById("active-run-banner");
+      const bannerQueueBtn = document.getElementById("banner-queue-btn");
+      const queueNextBtn = document.getElementById("queue-next-btn");
 
       badge.className = "badge badge-" + (data.status || "idle");
       badge.textContent = (data.status || "idle").toUpperCase();
 
-      if (isRunning) {
-        startBtn.disabled = true;
-        abortBtn.style.display = "block";
-        const mins = Math.floor((data.elapsed_sec || 0) / 60);
-        const secs = (data.elapsed_sec || 0) % 60;
-        elapsedSpan.textContent = `Running: ${mins}m ${secs}s`;
+      // Update Queued Run Card
+      const queuedCard = document.getElementById("queued-run-card");
+      if (queuedCard) {
+        if (currentQueue.length > 0) {
+          const q = currentQueue[0];
+          queuedCard.style.display = "block";
+          const qIdEl = document.getElementById("queued-run-id-label");
+          const qProfEl = document.getElementById("queued-run-profile-label");
+          if (qIdEl) qIdEl.textContent = `#${q.queue_id}`;
+          if (qProfEl) qProfEl.textContent = q.profile || "default";
 
-        if (currentActiveRunId !== data.run_id && data.options && Object.keys(data.options).length > 0) {
-          currentActiveRunId = data.run_id;
-          populateFormFromOptions(data.options);
-          setFormInputsDisabled(true);
+          const opt = q.options || {};
+          const wfText = opt.workflow === "compile_only" ? "Compile Only" : (opt.workflow === "skip_compile" ? "Train Only" : (opt.workflow === "pull_only" ? "Pull & Compile" : "Full Pipeline"));
+          const summaryParts = [
+            `<strong>Workflow:</strong> ${wfText}`,
+            opt.base_model ? `<strong>Model:</strong> ${opt.base_model}` : null,
+            opt.epochs ? `<strong>Epochs:</strong> ${opt.epochs}` : null,
+            opt.batch ? `<strong>Batch:</strong> ${opt.batch}` : null,
+            opt.imgsz ? `<strong>ImgSz:</strong> ${opt.imgsz}` : null,
+            opt.device ? `<strong>Device:</strong> ${opt.device}` : null,
+            opt.do_export ? `<strong>CVAT Export:</strong> ${Array.isArray(opt.export_tasks) && opt.export_tasks.length ? opt.export_tasks.length + ' task(s)' : 'Enabled'}` : null,
+          ].filter(Boolean);
+
+          const summaryEl = document.getElementById("queued-run-summary");
+          if (summaryEl) summaryEl.innerHTML = summaryParts.join(" &bull; ");
+
+          const startNowBtn = document.getElementById("queued-start-now-btn");
+          const noticeEl = document.getElementById("queued-run-status-notice");
+          if (!isRunning) {
+            if (startNowBtn) startNowBtn.style.display = "inline-block";
+            if (noticeEl) noticeEl.innerHTML = `<span>⚡ Current run finished. Queued run is ready to execute.</span>`;
+          } else {
+            if (startNowBtn) startNowBtn.style.display = "none";
+            if (noticeEl) noticeEl.innerHTML = `<span>⏳ Will automatically start when current pipeline execution completes.</span>`;
+          }
+        } else {
+          queuedCard.style.display = "none";
         }
-      } else {
-        startBtn.disabled = false;
-        abortBtn.style.display = "none";
-        elapsedSpan.textContent = "";
+      }
 
-        if (currentActiveRunId !== null) {
-          currentActiveRunId = null;
-          setFormInputsDisabled(false);
+      // Update Active Banner & Queue action buttons
+      if (isRunning) {
+        if (!previouslyRunning) {
+          userManuallyToggledSettings = false;
+          if (isMobileWebFormat()) {
+            collapseSettingsPanes(true);
+          } else {
+            collapseSettingsPanes(false);
+          }
+        }
+        if (banner) banner.style.display = "block";
+        if (bannerQueueBtn) {
+          bannerQueueBtn.style.display = "inline-block";
+          bannerQueueBtn.textContent = currentQueue.length > 0 ? "✏️ Edit Queued Run" : "+ Setup Next Run";
+        }
+        if (queueNextBtn) {
+          queueNextBtn.style.display = "block";
+          queueNextBtn.textContent = currentQueue.length > 0 ? "✏️ View / Edit Queued Next Run" : "+ Setup & Queue Next Run";
+        }
+        if (startBtn) startBtn.disabled = true;
+        if (abortBtn) abortBtn.style.display = "block";
+        if (elapsedSpan) elapsedSpan.textContent = `Running: ${formatDuration(data.elapsed_sec)}`;
+      } else {
+        if (previouslyRunning) {
+          userManuallyToggledSettings = false;
+          collapseSettingsPanes(false);
+        }
+        if (banner) banner.style.display = "none";
+        if (bannerQueueBtn) bannerQueueBtn.style.display = "none";
+        if (queueNextBtn) queueNextBtn.style.display = "none";
+        if (startBtn) startBtn.disabled = false;
+        if (abortBtn) abortBtn.style.display = "none";
+        if (elapsedSpan) elapsedSpan.textContent = "";
+      }
+
+      // If user is currently editing or setting up a queued run, preserve user form input
+      if (formMode !== "normal") {
+        // Do not touch form inputs
+      } else {
+        if (isRunning) {
+          if (currentActiveRunId !== data.run_id && data.options && Object.keys(data.options).length > 0) {
+            currentActiveRunId = data.run_id;
+            cachedActiveRunOptions = data.options;
+            populateFormFromOptions(data.options);
+            setFormInputsDisabled(true);
+          }
+        } else {
+          if (currentActiveRunId !== null) {
+            currentActiveRunId = null;
+            cachedActiveRunOptions = null;
+            setFormInputsDisabled(false);
+          }
         }
       }
 
@@ -2236,13 +2682,13 @@ def get_html_content() -> str:
           tr.className = "history-row" + (selectedHistoryRunId === run.run_id ? " active-history-row" : "");
           tr.dataset.runId = run.run_id;
           tr.title = "Click to inspect execution logs for Run #" + run.run_id;
-          tr.onclick = () => selectHistoryRun(run.run_id, run.profile, run.status);
+          tr.onclick = () => selectHistoryRun(run.run_id, run.profile, run.status, run.elapsed_sec);
           const artifactsHtml = (run.artifacts || []).map(a => `<div>${a.name} (${a.size})</div>`).join("") || "None";
           tr.innerHTML = `
             <td><strong>${run.run_id}</strong></td>
             <td>${run.profile}</td>
             <td><span class="badge badge-${run.status}">${run.status.toUpperCase()}</span></td>
-            <td>${run.elapsed_sec || 0}s</td>
+            <td>${formatDuration(run.elapsed_sec)}</td>
             <td>${artifactsHtml}</td>
           `;
           tbody.appendChild(tr);
@@ -2250,7 +2696,7 @@ def get_html_content() -> str:
       }
     }
 
-    async function selectHistoryRun(runId, profile, status) {
+    async function selectHistoryRun(runId, profile, status, elapsedSec) {
       selectedHistoryRunId = runId;
       document.querySelectorAll(".history-row").forEach(r => {
         r.classList.toggle("active-history-row", r.dataset.runId === runId);
@@ -2262,7 +2708,8 @@ def get_html_content() -> str:
       const closeBtn = document.getElementById("hist-close-btn");
       const consoleEl = document.getElementById("hist-console");
 
-      titleEl.textContent = `Logs: Run #${runId} (${profile})`;
+      const durationStr = (elapsedSec !== undefined && elapsedSec !== null) ? ` [${formatDuration(elapsedSec)}]` : "";
+      titleEl.textContent = `Logs: Run #${runId} (${profile})${durationStr}`;
       badgeEl.className = "badge badge-" + (status || "idle");
       badgeEl.textContent = (status || "unknown").toUpperCase();
       badgeEl.style.display = "inline-block";
@@ -2305,9 +2752,9 @@ def get_html_content() -> str:
       document.getElementById("hist-console").innerHTML = `<div style="color: var(--text-muted); text-align: center; padding: 3rem 1rem;">Select a past run from the table above to view its console log stream.</div>`;
     }
 
-    async function startTraining() {
+    function collectFormPayload() {
       const doExport = document.getElementById("do-export").checked;
-      const payload = {
+      return {
         profile: document.getElementById("profile-select").value,
         workflow: document.getElementById("workflow-select").value,
         custom_checkpoint: document.getElementById("custom-checkpoint").value.trim() || null,
@@ -2336,6 +2783,135 @@ def get_html_content() -> str:
         log_console: document.getElementById("log-console").checked,
         log_file: document.getElementById("log-file").checked,
       };
+    }
+
+    function enterQueueMode(queueId = null) {
+      if (queueId) {
+        editingQueueId = queueId;
+        formMode = "queue_edit";
+        const item = currentQueue.find(q => q.queue_id === queueId);
+        if (item && item.options) {
+          populateFormFromOptions(item.options);
+        }
+        const titleEl = document.getElementById("queue-mode-title");
+        if (titleEl) titleEl.textContent = `✏️ Edit Queued Run (#${queueId})`;
+        const submitBtn = document.getElementById("btn-submit-queue");
+        if (submitBtn) submitBtn.textContent = `Update Queued Run (#${queueId})`;
+      } else {
+        editingQueueId = null;
+        formMode = "queue_setup";
+        const titleEl = document.getElementById("queue-mode-title");
+        if (titleEl) titleEl.textContent = "📋 Setup Next Model Run (Queued)";
+        const submitBtn = document.getElementById("btn-submit-queue");
+        if (submitBtn) submitBtn.textContent = "Queue Model Run (Starts After Current Run)";
+      }
+
+      document.getElementById("queue-mode-banner").style.display = "block";
+      document.getElementById("normal-action-buttons").style.display = "none";
+      document.getElementById("queue-action-buttons").style.display = "flex";
+
+      collapseSettingsPanes(false);
+      setFormInputsDisabled(false);
+
+      const panes = document.getElementById("studio-config-panes");
+      if (panes) {
+        panes.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }
+
+    function exitQueueMode() {
+      formMode = "normal";
+      editingQueueId = null;
+
+      document.getElementById("queue-mode-banner").style.display = "none";
+      document.getElementById("queue-action-buttons").style.display = "none";
+      document.getElementById("normal-action-buttons").style.display = "block";
+
+      if (isRunning) {
+        if (cachedActiveRunOptions) {
+          populateFormFromOptions(cachedActiveRunOptions);
+        }
+        setFormInputsDisabled(true);
+        if (isMobileWebFormat() && !userManuallyToggledSettings) {
+          collapseSettingsPanes(true);
+        }
+      } else {
+        setFormInputsDisabled(false);
+      }
+    }
+
+    async function submitQueuedRun() {
+      const payload = collectFormPayload();
+      if (editingQueueId) {
+        payload.queue_id = editingQueueId;
+      }
+
+      try {
+        const res = await fetch("/api/queue", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await res.json();
+        if (!res.ok) {
+          alert("Error queueing run: " + (result.error || "Failed to queue run"));
+          return;
+        }
+
+        exitQueueMode();
+        pollStatus();
+      } catch (err) {
+        alert("Network error while queueing run: " + err);
+      }
+    }
+
+    function editQueuedRun(queueId = null) {
+      const qid = queueId || (currentQueue[0] ? currentQueue[0].queue_id : null);
+      if (qid) {
+        enterQueueMode(qid);
+      }
+    }
+
+    async function cancelQueuedRun(queueId = null) {
+      const qid = queueId || (currentQueue[0] ? currentQueue[0].queue_id : null);
+      if (!confirm(`Are you sure you want to remove queued run #${qid || ''} from the queue?`)) return;
+
+      try {
+        const res = await fetch("/api/queue/cancel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ queue_id: qid })
+        });
+        const result = await res.json();
+        if (!res.ok) {
+          alert("Error: " + (result.error || "Failed to cancel queued run"));
+        } else {
+          pollStatus();
+        }
+      } catch (err) {
+        alert("Network error: " + err);
+      }
+    }
+
+    async function startQueuedRunNow() {
+      if (!confirm("Start the queued run now?")) return;
+      clearConsole();
+      try {
+        const res = await fetch("/api/queue/start", { method: "POST" });
+        const result = await res.json();
+        if (!res.ok) {
+          alert("Error: " + (result.error || "Failed to start queued run"));
+        } else {
+          pollStatus();
+        }
+      } catch (err) {
+        alert("Network error: " + err);
+      }
+    }
+
+    async function startTraining() {
+      clearConsole();
+      const payload = collectFormPayload();
 
       try {
         const res = await fetch("/api/train", {
@@ -2347,6 +2923,10 @@ def get_html_content() -> str:
         if (!res.ok) {
           alert("Error: " + (result.error || "Failed to start training"));
         } else {
+          userManuallyToggledSettings = false;
+          if (isMobileWebFormat()) {
+            collapseSettingsPanes(true);
+          }
           pollStatus();
         }
       } catch (err) {
@@ -2455,6 +3035,10 @@ class StudioHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif path == "/api/queue":
+            queue_data = self.server.run_manager.get_queued_runs()  # type: ignore[attr-defined]
+            self._send_json({"ok": True, "queue": queue_data})
+
         elif path == "/api/history/logs":
             query = urllib.parse.parse_qs(parsed.query)
             run_id = query.get("run_id", [""])[0]
@@ -2486,7 +3070,9 @@ class StudioHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                         else:
                             line, replace = item, False
 
-                        if replace:
+                        if replace == "clear":
+                            self.wfile.write(b"event: clear\ndata: {}\n\n")
+                        elif replace:
                             self.wfile.write(f"event: replace\ndata: {line}\n\n".encode("utf-8"))
                         else:
                             self.wfile.write(f"data: {line}\n\n".encode("utf-8"))
@@ -2543,6 +3129,58 @@ class StudioHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json_error(400, msg)
             else:
                 self._send_json({"ok": True, "message": msg})
+
+        elif path == "/api/queue":
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 1024 * 64:
+                self.send_response(413)
+                self.end_headers()
+                return
+
+            try:
+                raw_body = self.rfile.read(length).decode("utf-8")
+                payload = json.loads(raw_body)
+            except Exception:
+                self._send_json_error(400, "Invalid JSON payload")
+                return
+
+            cfg = config_utils.load_config(self.server.config_path)  # type: ignore[attr-defined]
+            try:
+                cmd_args, summary = build_validated_train_args(payload, cfg)
+            except ValueError as e:
+                self._send_json_error(400, str(e))
+                return
+
+            profile_name = payload.get("profile") or cfg.get("default_profile", "torq")
+            queue_id = payload.get("queue_id")
+            success, action, item = self.server.run_manager.queue_run(cmd_args, profile_name, payload, queue_id=queue_id)  # type: ignore[attr-defined]
+            if not success:
+                self._send_json_error(400, action)
+            else:
+                self._send_json({"ok": True, "action": action, "item": item})
+
+        elif path in ("/api/queue/cancel", "/api/queue/delete"):
+            length = int(self.headers.get("Content-Length", 0))
+            queue_id = None
+            if length > 0:
+                try:
+                    raw_body = self.rfile.read(length).decode("utf-8")
+                    payload = json.loads(raw_body)
+                    queue_id = payload.get("queue_id")
+                except Exception:
+                    pass
+            success, msg = self.server.run_manager.cancel_queued_run(queue_id)  # type: ignore[attr-defined]
+            if not success:
+                self._send_json_error(404, msg)
+            else:
+                self._send_json({"ok": True, "message": msg})
+
+        elif path == "/api/queue/start":
+            success, msg = self.server.run_manager.start_next_queued_run()  # type: ignore[attr-defined]
+            if not success:
+                self._send_json_error(400, msg)
+            else:
+                self._send_json({"ok": True, "run_id": msg})
 
         elif path == "/api/profiles":
             length = int(self.headers.get("Content-Length", 0))
@@ -2632,7 +3270,16 @@ class StudioHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
-        if path == "/api/profiles":
+        if path == "/api/queue":
+            query = urllib.parse.parse_qs(parsed.query)
+            queue_id = query.get("queue_id", [None])[0]
+            success, msg = self.server.run_manager.cancel_queued_run(queue_id)  # type: ignore[attr-defined]
+            if not success:
+                self._send_json_error(404, msg)
+            else:
+                self._send_json({"ok": True, "message": msg})
+
+        elif path == "/api/profiles":
             query = urllib.parse.parse_qs(parsed.query)
             name = query.get("name", [""])[0]
             clean_name = sanitize_input(name).strip().lower()

@@ -164,6 +164,7 @@ def test_main_dry_run(folder_cvat_module, tmp_path, capsys):
         str(img_dir),
         "--labels-file", str(yaml_file),
         "--task-name", "DryRunTest",
+        "--no-detect",
         "--dry-run",
     ])
 
@@ -173,3 +174,131 @@ def test_main_dry_run(folder_cvat_module, tmp_path, capsys):
     assert "Total Images : 2" in captured.out
     assert "Labels (2)  : ['cat', 'dog']" in captured.out
     assert "Task Name    : DryRunTest" in captured.out
+
+
+def test_load_model_classes(folder_cvat_module, tmp_path):
+    model_json = tmp_path / "custom_model.json"
+    model_json.write_text(json.dumps({
+        "names": {
+            "0": "cat",
+            "1": "dog",
+            "2": "fox"
+        }
+    }), encoding="utf-8")
+
+    classes = folder_cvat_module.load_model_classes(tmp_path / "custom_model.onnx")
+    assert classes == {0: "cat", 1: "dog", 2: "fox"}
+
+
+def test_resolve_execution_device(folder_cvat_module):
+    # Test CPU resolution
+    dev = folder_cvat_module.resolve_execution_device("some_model.onnx", requested_device="cpu")
+    assert dev == "cpu"
+
+
+def test_generate_coco_annotations_mock(folder_cvat_module, tmp_path, monkeypatch):
+    from PIL import Image
+
+    img1 = tmp_path / "test1.jpg"
+    Image.new("RGB", (100, 100), color="red").save(img1)
+
+    class MockBox:
+        cls = [0]
+        conf = [0.85]
+        xyxy = [[10.0, 15.0, 60.0, 75.0]]
+
+        def __len__(self):
+            return 1
+
+    class MockResults:
+        boxes = MockBox()
+
+    class MockYOLO:
+        def __init__(self, model_path):
+            pass
+
+        def __call__(self, *args, **kwargs):
+            import torch
+            box_mock = MockBox()
+            box_mock.cls = torch.tensor([0])
+            box_mock.conf = torch.tensor([0.85])
+            box_mock.xyxy = torch.tensor([[10.0, 15.0, 60.0, 75.0]])
+            res = MockResults()
+            res.boxes = box_mock
+            return [res]
+
+    import ultralytics
+    monkeypatch.setattr(ultralytics, "YOLO", MockYOLO)
+
+    model_file = tmp_path / "mock.onnx"
+    model_file.touch()
+
+    coco_data, labels = folder_cvat_module.generate_coco_annotations(
+        images=[img1],
+        model_path=model_file,
+        device="cpu",
+        conf_thresh=0.5,
+        imgsz=320,
+        model_classes={0: "person", 1: "car"},
+    )
+
+    assert labels == ["person", "car"]
+    assert len(coco_data["images"]) == 1
+    assert coco_data["images"][0]["file_name"] == "test1.jpg"
+    assert coco_data["images"][0]["width"] == 100
+    assert coco_data["images"][0]["height"] == 100
+
+    assert len(coco_data["annotations"]) == 1
+    ann = coco_data["annotations"][0]
+    assert ann["category_id"] == 1
+    assert ann["bbox"] == [10.0, 15.0, 50.0, 60.0]  # [x, y, w, h]
+
+
+def test_upload_folder_to_cvat_with_annotations_mock(folder_cvat_module, tmp_path, monkeypatch):
+    class MockTask:
+        id = 456
+        name = "Detection Task"
+        imported_file = None
+
+        def import_annotations(self, format_name, filename):
+            assert format_name == "COCO 1.0"
+            self.imported_file = filename
+
+    mock_task_instance = MockTask()
+
+    class MockTasksAPI:
+        def create_from_data(self, spec, resources):
+            assert spec["name"] == "Detection Task"
+            return mock_task_instance
+
+    class MockClient:
+        tasks = MockTasksAPI()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    import cvat_sdk
+    monkeypatch.setattr(cvat_sdk, "make_client", lambda url, credentials: MockClient())
+
+    img1 = tmp_path / "img1.jpg"
+    img1.touch()
+    ann_file = tmp_path / "annotations.json"
+    ann_file.write_text("{}", encoding="utf-8")
+
+    task_id = folder_cvat_module.upload_folder_to_cvat(
+        images=[img1],
+        labels=["person"],
+        task_name="Detection Task",
+        cvat_url="http://cvat.local:8080",
+        cvat_user="testuser",
+        cvat_pass="testpass",
+        annotations_path=ann_file,
+        base_dir=tmp_path,
+    )
+
+    assert task_id == 456
+    assert mock_task_instance.imported_file == str(ann_file)
+

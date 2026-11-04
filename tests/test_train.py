@@ -164,4 +164,20 @@ def test_remote_clean_images_preserves_coco(tmp_path):
     assert (coco128_dir / "img128.jpg").is_file()
 
 
+def test_ensure_environment_defaults(monkeypatch):
+    import os
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("USERNAME", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+
+    train.ensure_environment_defaults()
+
+    assert os.environ.get("USER") == "root"
+    assert os.environ.get("USERNAME") == "root"
+    assert os.environ.get("LOGNAME") == "root"
+    assert os.environ.get("HOME") is not None
+
+
+
 
