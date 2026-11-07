@@ -160,6 +160,31 @@ def test_step3_prepare_calibration_npy_and_dir(tmp_path):
     assert len(jpgs) == 2
 
 
+def test_step4_generate_labels_json_no_symlinks_by_default(tmp_path):
+    y_file = tmp_path / "data.yaml"
+    y_file.write_text(yaml.safe_dump({"names": {0: "person", 80: "chicken"}}))
+
+    models_dir = tmp_path / "models"
+    target_dir = models_dir / "hailo"
+    run_dir = target_dir / "261023-0800"
+    labels_out = run_dir / "hailo_yolov8m_261023-0800.json"
+
+    prepare_for_onnx2tf.step4_generate_labels_json(
+        data_yaml_path=str(y_file),
+        labels_out=str(labels_out),
+        tflite_path=str(tmp_path / "nonexistent.tflite"),
+        base_model_name="yolov8m",
+        imgsz=640,
+        target="hailo",
+    )
+
+    assert labels_out.is_file()
+    assert (run_dir / "hailo_yolov8m_261023-0800.txt").is_file()
+    # Symlinks should NOT be created by default
+    assert not (target_dir / "hailo_yolov8m.json").exists()
+    assert not (target_dir / "labels.json").exists()
+
+
 def test_step4_generate_labels_json_and_symlinks(tmp_path):
     y_file = tmp_path / "data.yaml"
     y_file.write_text(yaml.safe_dump({"names": {0: "person", 80: "chicken"}}))
@@ -176,6 +201,7 @@ def test_step4_generate_labels_json_and_symlinks(tmp_path):
         base_model_name="yolov8m",
         imgsz=640,
         target="hailo",
+        create_symlinks=True,
     )
 
     assert labels_out.is_file()

@@ -179,5 +179,64 @@ def test_ensure_environment_defaults(monkeypatch):
     assert os.environ.get("HOME") is not None
 
 
+def test_update_model_symlinks_success(tmp_path):
+    target_dir = tmp_path / "models" / "hailo"
+    run_dir = target_dir / "261104-1200"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    hef_file = run_dir / "hailo_yolov8m_261104-1200.hef"
+    hef_file.write_text("binary content")
+    json_file = run_dir / "hailo_yolov8m_261104-1200.json"
+    json_file.write_text("{}")
+    txt_file = run_dir / "hailo_yolov8m_261104-1200.txt"
+    txt_file.write_text("0 person")
+
+    links = train.update_model_symlinks(
+        models_target_dir=target_dir,
+        target_format="hailo",
+        run_name_stem="yolov8m",
+        base_model_name="yolov8m",
+        primary_artifact=hef_file,
+        labels_file=json_file,
+        timestamp="261104-1200",
+    )
+
+    assert "model" in links
+    assert (target_dir / "hailo_yolov8m.hef").is_symlink()
+    assert (target_dir / "hailo_yolov8m.hef").resolve() == hef_file.resolve()
+    assert (target_dir / "hailo_yolov8m.json").is_symlink()
+    assert (target_dir / "hailo_yolov8m.json").resolve() == json_file.resolve()
+    assert (target_dir / "hailo_yolov8m.txt").is_symlink()
+    assert (target_dir / "hailo_yolov8m.txt").resolve() == txt_file.resolve()
+    assert (target_dir / "labels.json").is_symlink()
+    assert (target_dir / "labels.txt").is_symlink()
+
+
+def test_update_model_symlinks_missing_artifacts(tmp_path):
+    target_dir = tmp_path / "models" / "hailo"
+    run_dir = target_dir / "261104-1200"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    missing_hef = run_dir / "missing.hef"
+    json_file = run_dir / "labels.json"
+    json_file.write_text("{}")
+
+    # If primary artifact doesn't exist (e.g. compilation failed), symlinks must not be created
+    links = train.update_model_symlinks(
+        models_target_dir=target_dir,
+        target_format="hailo",
+        run_name_stem="yolov8m",
+        base_model_name="yolov8m",
+        primary_artifact=missing_hef,
+        labels_file=json_file,
+        timestamp="261104-1200",
+    )
+
+    assert links == {}
+    assert not (target_dir / "hailo_yolov8m.hef").exists()
+    assert not (target_dir / "labels.json").exists()
+
+
+
 
 

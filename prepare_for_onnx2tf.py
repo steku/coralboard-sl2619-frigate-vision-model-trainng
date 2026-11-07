@@ -393,6 +393,7 @@ def step4_generate_labels_json(
     base_model_name: str = None,
     target: str = "torq",
     imgsz: int = 320,
+    create_symlinks: bool = False,
 ):
     names = load_dataset_metadata(data_yaml_path)
     resolved_base = base_model_name or model_name
@@ -452,20 +453,21 @@ def step4_generate_labels_json(
         for k in sorted(names.keys(), key=int):
             f.write(f"{k} {names[k]}\n")
 
-    # Create soft links without datetime in models/<target>/ (or parent directory if standalone)
-    labels_dir = labels_path.parent
-    if labels_dir.parent != labels_dir and (
-        labels_dir.parent.name in ("torq", "nvidia", "hailo")
-        or (labels_dir.parent.parent != labels_dir.parent and labels_dir.parent.parent.name == "models")
-    ):
-        symlink_dir = labels_dir.parent
-    else:
-        symlink_dir = labels_dir
+    # Create soft links without datetime in models/<target>/ (only when explicitly requested)
+    if create_symlinks:
+        labels_dir = labels_path.parent
+        if labels_dir.parent != labels_dir and (
+            labels_dir.parent.name in ("torq", "nvidia", "hailo")
+            or (labels_dir.parent.parent != labels_dir.parent and labels_dir.parent.parent.name == "models")
+        ):
+            symlink_dir = labels_dir.parent
+        else:
+            symlink_dir = labels_dir
 
-    _update_symlink(symlink_dir / f"{target}_{resolved_base}.json", labels_path)
-    _update_symlink(symlink_dir / f"{target}_{resolved_base}.txt", txt_out)
-    _update_symlink(symlink_dir / "labels.json", labels_path)
-    _update_symlink(symlink_dir / "labels.txt", txt_out)
+        _update_symlink(symlink_dir / f"{target}_{resolved_base}.json", labels_path)
+        _update_symlink(symlink_dir / f"{target}_{resolved_base}.txt", txt_out)
+        _update_symlink(symlink_dir / "labels.json", labels_path)
+        _update_symlink(symlink_dir / "labels.txt", txt_out)
 
 
 def _update_symlink(link_path: Path, target_path: Path) -> None:
@@ -541,7 +543,7 @@ def main():
         else:
             output_labels = f"{args.target}_{detected_name}_{timestamp}.json"
 
-    step4_generate_labels_json(args.data_yaml, output_labels, model_name=detected_name, base_model_name=detected_name, target=args.target, imgsz=args.imgsz)
+    step4_generate_labels_json(args.data_yaml, output_labels, model_name=detected_name, base_model_name=detected_name, target=args.target, imgsz=args.imgsz, create_symlinks=True)
     print(f"Pre-conversion preparation finished successfully! Labels written to: {output_labels}")
 
 

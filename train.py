@@ -158,6 +158,69 @@ def relocate_root_checkpoints(project_root: Path, base_dir: Path) -> None:
                 pass
 
 
+def update_model_symlinks(
+    models_target_dir: Path,
+    target_format: str,
+    run_name_stem: str,
+    base_model_name: str,
+    primary_artifact: Path,
+    labels_file: Path,
+    timestamp: str,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, Path]:
+    """Create or update non-timestamped soft links in models/<target>/ only after a fully successful run."""
+    created_links: Dict[str, Path] = {}
+    log = logger or logging.getLogger("train")
+
+    if not primary_artifact.is_file() or not labels_file.is_file():
+        log.warning(
+            "Artifact verification failed (%s or %s missing); skipping symlink update.",
+            primary_artifact,
+            labels_file,
+        )
+        return created_links
+
+    models_target_dir.mkdir(parents=True, exist_ok=True)
+    model_ext = primary_artifact.suffix
+    model_symlink = models_target_dir / f"{target_format}_{run_name_stem}{model_ext}"
+    if model_symlink.exists() or model_symlink.is_symlink():
+        model_symlink.unlink()
+    model_symlink.symlink_to(Path(timestamp) / primary_artifact.name)
+    log.info("Created soft link: %s -> %s/%s", model_symlink, timestamp, primary_artifact.name)
+    created_links["model"] = model_symlink
+
+    labels_json_symlink = models_target_dir / f"{target_format}_{base_model_name}.json"
+    if labels_json_symlink.exists() or labels_json_symlink.is_symlink():
+        labels_json_symlink.unlink()
+    labels_json_symlink.symlink_to(Path(timestamp) / labels_file.name)
+    log.info("Created soft link: %s -> %s/%s", labels_json_symlink, timestamp, labels_file.name)
+    created_links["labels_json"] = labels_json_symlink
+
+    labels_txt_file = labels_file.with_suffix(".txt")
+    if labels_txt_file.is_file():
+        labels_txt_symlink = models_target_dir / f"{target_format}_{base_model_name}.txt"
+        if labels_txt_symlink.exists() or labels_txt_symlink.is_symlink():
+            labels_txt_symlink.unlink()
+        labels_txt_symlink.symlink_to(Path(timestamp) / labels_txt_file.name)
+        log.info("Created soft link: %s -> %s/%s", labels_txt_symlink, timestamp, labels_txt_file.name)
+        created_links["labels_txt"] = labels_txt_symlink
+
+    generic_labels_json = models_target_dir / "labels.json"
+    if generic_labels_json.exists() or generic_labels_json.is_symlink():
+        generic_labels_json.unlink()
+    generic_labels_json.symlink_to(Path(timestamp) / labels_file.name)
+    created_links["generic_labels_json"] = generic_labels_json
+
+    if labels_txt_file.is_file():
+        generic_labels_txt = models_target_dir / "labels.txt"
+        if generic_labels_txt.exists() or generic_labels_txt.is_symlink():
+            generic_labels_txt.unlink()
+        generic_labels_txt.symlink_to(Path(timestamp) / labels_txt_file.name)
+        created_links["generic_labels_txt"] = generic_labels_txt
+
+    return created_links
+
+
 def verify_required_tools(target_format: str, skip_compile: bool) -> Optional[Path]:
     """Verify tool binaries exist in active environment or return Hailo venv path."""
     required = ["yolo"]
@@ -1093,41 +1156,6 @@ def main() -> int:
         primary_artifact = output_vmfb
 
     # --------------------------------------------------------------------------
-    # Create Non-Timestamped Soft Links in models/<target>/
-    # --------------------------------------------------------------------------
-    model_ext = primary_artifact.suffix
-    model_symlink = models_target_dir / f"{target_format}_{run_name_stem}{model_ext}"
-    if model_symlink.exists() or model_symlink.is_symlink():
-        model_symlink.unlink()
-    model_symlink.symlink_to(Path(timestamp) / primary_artifact.name)
-    logger.info("Created soft link: %s -> %s/%s", model_symlink, timestamp, primary_artifact.name)
-
-    labels_json_symlink = models_target_dir / f"{target_format}_{base_model_name}.json"
-    if labels_json_symlink.exists() or labels_json_symlink.is_symlink():
-        labels_json_symlink.unlink()
-    labels_json_symlink.symlink_to(Path(timestamp) / labels_file.name)
-    logger.info("Created soft link: %s -> %s/%s", labels_json_symlink, timestamp, labels_file.name)
-
-    labels_txt_file = labels_file.with_suffix(".txt")
-    labels_txt_symlink = models_target_dir / f"{target_format}_{base_model_name}.txt"
-    if labels_txt_file.is_file():
-        if labels_txt_symlink.exists() or labels_txt_symlink.is_symlink():
-            labels_txt_symlink.unlink()
-        labels_txt_symlink.symlink_to(Path(timestamp) / labels_txt_file.name)
-        logger.info("Created soft link: %s -> %s/%s", labels_txt_symlink, timestamp, labels_txt_file.name)
-
-    generic_labels_json = models_target_dir / "labels.json"
-    if generic_labels_json.exists() or generic_labels_json.is_symlink():
-        generic_labels_json.unlink()
-    generic_labels_json.symlink_to(Path(timestamp) / labels_file.name)
-
-    if labels_txt_file.is_file():
-        generic_labels_txt = models_target_dir / "labels.txt"
-        if generic_labels_txt.exists() or generic_labels_txt.is_symlink():
-            generic_labels_txt.unlink()
-        generic_labels_txt.symlink_to(Path(timestamp) / labels_txt_file.name)
-
-    # --------------------------------------------------------------------------
     # Step 4: Optional Deployment
     # --------------------------------------------------------------------------
     if not args.skip_deploy and (deploy_host or deploy_dir):
@@ -1135,7 +1163,7 @@ def main() -> int:
         restart_srv = bool(dep_cfg.get("restart_service", False))
         srv_name = dep_cfg.get("service_name", "coralboard-sl2619-vision")
 
-        deploy_artifacts(
+        deploy_ok = deploy_artifacts(
             model_path=primary_artifact,
             labels_path=labels_file,
             deploy_host=deploy_host,
@@ -1145,6 +1173,28 @@ def main() -> int:
             do_health_check=False,
             logger=logger,
         )
+        if not deploy_ok:
+            logger.error("Deployment failed; aborting pipeline without updating model symlinks.")
+            return 1
+
+    # --------------------------------------------------------------------------
+    # Update Non-Timestamped Soft Links in models/<target>/
+    # (Executed ONLY after the entire pipeline run has completed successfully)
+    # --------------------------------------------------------------------------
+    created_symlinks = update_model_symlinks(
+        models_target_dir=models_target_dir,
+        target_format=target_format,
+        run_name_stem=run_name_stem,
+        base_model_name=base_model_name,
+        primary_artifact=primary_artifact,
+        labels_file=labels_file,
+        timestamp=timestamp,
+        logger=logger,
+    )
+    model_symlink = created_symlinks.get("model")
+    labels_json_symlink = created_symlinks.get("labels_json")
+    labels_txt_symlink = created_symlinks.get("labels_txt")
+    labels_txt_file = labels_file.with_suffix(".txt")
 
     # --------------------------------------------------------------------------
     # Summary Report
